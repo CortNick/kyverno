@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"flag"
+	"fmt"
 	"os"
 	"strings"
 	"time"
@@ -11,6 +12,8 @@ import (
 	"github.com/kyverno/kyverno/cmd/internal"
 	"github.com/kyverno/kyverno/pkg/admissionpolicy"
 	"github.com/kyverno/kyverno/pkg/breaker"
+	celcompiler "github.com/kyverno/kyverno/pkg/cel/compiler"
+	"github.com/kyverno/kyverno/pkg/cel/libs"
 	"github.com/kyverno/kyverno/pkg/client/clientset/versioned"
 	kyvernoinformer "github.com/kyverno/kyverno/pkg/client/informers/externalversions"
 	"github.com/kyverno/kyverno/pkg/clients/dclient"
@@ -27,6 +30,7 @@ import (
 	"github.com/kyverno/kyverno/pkg/globalcontext/store"
 	"github.com/kyverno/kyverno/pkg/leaderelection"
 	"github.com/kyverno/kyverno/pkg/logging"
+	"github.com/kyverno/kyverno/pkg/toggle"
 	kubeutils "github.com/kyverno/kyverno/pkg/utils/kube"
 	reportutils "github.com/kyverno/kyverno/pkg/utils/report"
 	openreportsclient "github.com/openreports/reports-api/pkg/client/clientset/versioned/typed/openreports.io/v1alpha1"
@@ -38,6 +42,7 @@ import (
 	admissionregistrationv1informers "k8s.io/client-go/informers/admissionregistration/v1"
 	admissionregistrationv1alpha1informers "k8s.io/client-go/informers/admissionregistration/v1alpha1"
 	admissionregistrationv1beta1informers "k8s.io/client-go/informers/admissionregistration/v1beta1"
+	corev1listers "k8s.io/client-go/listers/core/v1"
 	metadatainformers "k8s.io/client-go/metadata/metadatainformer"
 	"k8s.io/client-go/restmapper"
 	kyamlopenapi "sigs.k8s.io/kustomize/kyaml/openapi"
@@ -84,26 +89,40 @@ func createReportControllers(
 	eventGenerator event.Interface,
 	gcstore store.Store,
 	typeConverter patch.TypeConverterManager,
+	secretLister corev1listers.SecretLister,
 ) ([]internal.Controller, func(context.Context) error) {
 	var ctrls []internal.Controller
 	var warmups []func(context.Context) error
 	var vapInformer admissionregistrationv1informers.ValidatingAdmissionPolicyInformer
 	var vapBindingInformer admissionregistrationv1informers.ValidatingAdmissionPolicyBindingInformer
-	var mapInformer admissionregistrationv1beta1informers.MutatingAdmissionPolicyInformer
+	var mapV1Informer admissionregistrationv1informers.MutatingAdmissionPolicyInformer
+	var mapBindingV1Informer admissionregistrationv1informers.MutatingAdmissionPolicyBindingInformer
+	var mapBetaInformer admissionregistrationv1beta1informers.MutatingAdmissionPolicyInformer
 	var mapAlphaInformer admissionregistrationv1alpha1informers.MutatingAdmissionPolicyInformer
-	var mapBindingInformer admissionregistrationv1beta1informers.MutatingAdmissionPolicyBindingInformer
+	var mapBindingBetaInformer admissionregistrationv1beta1informers.MutatingAdmissionPolicyBindingInformer
 	var mapAlphaBindingInformer admissionregistrationv1alpha1informers.MutatingAdmissionPolicyBindingInformer
 	if validatingAdmissionPolicyReports {
 		vapInformer = kubeInformer.Admissionregistration().V1().ValidatingAdmissionPolicies()
 		vapBindingInformer = kubeInformer.Admissionregistration().V1().ValidatingAdmissionPolicyBindings()
 	}
 	if mutatingAdmissionPolicyReports {
-		mapAlphaInformer = kubeInformer.Admissionregistration().V1alpha1().MutatingAdmissionPolicies()
-		mapAlphaBindingInformer = kubeInformer.Admissionregistration().V1alpha1().MutatingAdmissionPolicyBindings()
-
-		if kubeutils.HigherThanKubernetesVersion(client.GetKubeClient().Discovery(), logging.GlobalLogger(), 1, 34, 0) {
-			mapInformer = kubeInformer.Admissionregistration().V1beta1().MutatingAdmissionPolicies()
-			mapBindingInformer = kubeInformer.Admissionregistration().V1beta1().MutatingAdmissionPolicyBindings()
+		mapVersion, err := admissionpolicy.PreferredMutatingAdmissionPolicyVersion(client.GetKubeClient())
+		if err != nil {
+			logging.GlobalLogger().V(2).Info("MutatingAdmissionPolicy API is not registered, skipping MAP report informers", "error", err)
+		} else {
+			switch mapVersion {
+			case admissionpolicy.MutatingAdmissionPolicyVersionV1:
+				mapV1Informer = kubeInformer.Admissionregistration().V1().MutatingAdmissionPolicies()
+				mapBindingV1Informer = kubeInformer.Admissionregistration().V1().MutatingAdmissionPolicyBindings()
+			case admissionpolicy.MutatingAdmissionPolicyVersionV1beta1:
+				mapBetaInformer = kubeInformer.Admissionregistration().V1beta1().MutatingAdmissionPolicies()
+				mapBindingBetaInformer = kubeInformer.Admissionregistration().V1beta1().MutatingAdmissionPolicyBindings()
+			case admissionpolicy.MutatingAdmissionPolicyVersionV1alpha1:
+				mapAlphaInformer = kubeInformer.Admissionregistration().V1alpha1().MutatingAdmissionPolicies()
+				mapAlphaBindingInformer = kubeInformer.Admissionregistration().V1alpha1().MutatingAdmissionPolicyBindings()
+			default:
+				logging.GlobalLogger().Info("Unsupported MutatingAdmissionPolicy API version, skipping MAP report informers", "version", mapVersion)
+			}
 		}
 	}
 	kyvernoV1 := kyvernoInformer.Kyverno().V1()
@@ -117,10 +136,12 @@ func createReportControllers(
 			policiesV1beta1.ValidatingPolicies(),
 			policiesV1beta1.NamespacedValidatingPolicies(),
 			policiesV1beta1.MutatingPolicies(),
+			policiesV1beta1.NamespacedMutatingPolicies(),
 			policiesV1beta1.ImageValidatingPolicies(),
 			policiesV1beta1.NamespacedImageValidatingPolicies(),
 			vapInformer,
-			mapInformer,
+			mapV1Informer,
+			mapBetaInformer,
 			mapAlphaInformer,
 			metaClient,
 		)
@@ -147,9 +168,12 @@ func createReportControllers(
 					policiesV1beta1.ImageValidatingPolicies(),
 					policiesV1beta1.NamespacedImageValidatingPolicies(),
 					policiesV1beta1.GeneratingPolicies(),
+					policiesV1beta1.NamespacedGeneratingPolicies(),
 					policiesV1beta1.MutatingPolicies(),
+					policiesV1beta1.NamespacedMutatingPolicies(),
 					vapInformer,
-					mapInformer,
+					mapV1Informer,
+					mapBetaInformer,
 					mapAlphaInformer,
 				),
 				aggregationWorkers,
@@ -168,15 +192,18 @@ func createReportControllers(
 				policiesV1beta1.ValidatingPolicies(),
 				policiesV1beta1.NamespacedValidatingPolicies(),
 				policiesV1beta1.MutatingPolicies(),
+				policiesV1beta1.NamespacedMutatingPolicies(),
 				policiesV1beta1.ImageValidatingPolicies(),
 				policiesV1beta1.NamespacedImageValidatingPolicies(),
 				policiesV1beta1.PolicyExceptions(),
 				kyvernoV2.PolicyExceptions(),
 				vapInformer,
 				vapBindingInformer,
-				mapInformer,
+				mapV1Informer,
+				mapBindingV1Informer,
+				mapBetaInformer,
 				mapAlphaInformer,
-				mapBindingInformer,
+				mapBindingBetaInformer,
 				mapAlphaBindingInformer,
 				kubeInformer.Core().V1().Namespaces(),
 				resourceReportController,
@@ -185,9 +212,11 @@ func createReportControllers(
 				jp,
 				eventGenerator,
 				policyReports,
+				internal.ExceptionNamespace(),
 				gcstore,
 				restMapper,
 				typeConverter,
+				secretLister,
 			)
 			ctrls = append(ctrls, internal.NewController(
 				backgroundscancontroller.ControllerName,
@@ -230,6 +259,7 @@ func createrLeaderControllers(
 	backgroundScanInterval time.Duration,
 	gcstore store.Store,
 	typeConverter patch.TypeConverterManager,
+	secretLister corev1listers.SecretLister,
 ) ([]internal.Controller, func(context.Context) error, error) {
 	reportControllers, warmup := createReportControllers(
 		eng,
@@ -254,6 +284,7 @@ func createrLeaderControllers(
 		eventGenerator,
 		gcstore,
 		typeConverter,
+		secretLister,
 	)
 	return reportControllers, warmup, nil
 }
@@ -274,7 +305,9 @@ func main() {
 		omitEvents                       string
 		skipResourceFilters              bool
 		maxAPICallResponseLength         int64
+		apiCallTimeout                   time.Duration
 		maxBackgroundReports             int
+		maxGlobalContextEntries          int
 	)
 	flagset := flag.NewFlagSet("reports-controller", flag.ExitOnError)
 	flagset.BoolVar(&backgroundScan, "backgroundScan", true, "Enable or disable background scan.")
@@ -290,8 +323,13 @@ func main() {
 	flagset.StringVar(&omitEvents, "omitEvents", "", "Set this flag to a comma separated list of PolicyViolation, PolicyApplied, PolicyError, PolicySkipped to disable events, e.g. --omitEvents=PolicyApplied,PolicyViolation")
 	flagset.BoolVar(&skipResourceFilters, "skipResourceFilters", true, "If true, resource filters wont be considered.")
 	flagset.Int64Var(&maxAPICallResponseLength, "maxAPICallResponseLength", 2*1000*1000, "Maximum allowed response size from API Calls. A value of 0 bypasses checks (not recommended).")
+	flagset.DurationVar(&apiCallTimeout, "apiCallTimeout", 30*time.Second, "Timeout for HTTP API calls made by policies. A value of 0 means no timeout.")
 	flagset.IntVar(&maxBackgroundReports, "maxBackgroundReports", 10000, "Maximum number of ephemeralreports created for the background policies before we stop creating new ones")
+	flagset.IntVar(&maxGlobalContextEntries, "maxGlobalContextEntries", 0, "Maximum number of entries in the global context store. When the limit is reached, new entries are rejected and retried. A value of 0 means unbounded.")
 	flagset.BoolVar(&reportsCRDsSanityChecks, "reportsCRDsSanityChecks", true, "Enable or disable sanity checks for policy reports and ephemeral reports CRDs.")
+	flagset.Func(toggle.AllowHTTPInNamespacedPoliciesFlagName, toggle.AllowHTTPInNamespacedPoliciesDescription, toggle.AllowHTTPInNamespacedPolicies.Parse)
+	flagset.Func(toggle.HTTPBlocklistFlagName, toggle.HTTPBlocklistDescription, toggle.HTTPBlocklist.Parse)
+	flagset.Func(toggle.HTTPAllowlistFlagName, toggle.HTTPAllowlistDescription, toggle.HTTPAllowlist.Parse)
 	// config
 	appConfig := internal.NewConfiguration(
 		internal.WithProfiling(),
@@ -322,6 +360,12 @@ func main() {
 		internal.WithDefaultQps(300),
 		internal.WithDefaultBurst(300),
 	)
+	apicall.SetScopedTokenClientTimeout(apiCallTimeout)
+	// Validate HTTP blocklist/allowlist flags at startup (fail-fast).
+	if err := celcompiler.ValidateHTTPFlags(); err != nil {
+		fmt.Fprintf(os.Stderr, "invalid HTTP flag configuration: %v\n", err)
+		os.Exit(1)
+	}
 	var wg wait.Group
 	func() {
 		// setup
@@ -344,6 +388,21 @@ func main() {
 			}
 		}
 		setup.Logger.V(2).Info("background scan interval", "duration", backgroundScanInterval.String())
+
+		// call NewContextProvider to initialize the libraries context globally, needed during background scan
+		gcstore := store.New(maxGlobalContextEntries)
+		restMapper := restmapper.NewDeferredDiscoveryRESTMapper(memory.NewMemCacheClient(setup.KubeClient.Discovery()))
+		_, err := libs.NewContextProvider(
+			setup.KyvernoDynamicClient,
+			setup.RegistrySecretLister,
+			gcstore,
+			restMapper,
+			false,
+		)
+		if err != nil {
+			setup.Logger.Error(err, "failed to create cel context provider")
+			os.Exit(1)
+		}
 		// informer factories
 		kyvernoInformer := kyvernoinformer.NewSharedInformerFactory(setup.KyvernoClient, setup.ResyncPeriod)
 		polexCache, polexController := internal.NewExceptionSelector(setup.Logger, kyvernoInformer)
@@ -359,7 +418,6 @@ func main() {
 			eventGenerator,
 			event.Workers,
 		)
-		gcstore := store.New()
 		gceController := internal.NewController(
 			globalcontextcontroller.ControllerName,
 			globalcontextcontroller.NewController(
@@ -370,6 +428,7 @@ func main() {
 				gcstore,
 				eventGenerator,
 				maxAPICallResponseLength,
+				apiCallTimeout,
 				false,
 				setup.Jp,
 			),
@@ -382,12 +441,11 @@ func main() {
 			setup.Configuration,
 			setup.Jp,
 			setup.KyvernoDynamicClient,
-			setup.RegistryClient,
 			setup.ImageVerifyCacheClient,
 			setup.KubeClient,
 			setup.KyvernoClient,
 			setup.RegistrySecretLister,
-			apicall.NewAPICallConfiguration(maxAPICallResponseLength),
+			apicall.NewAPICallConfiguration(maxAPICallResponseLength, apiCallTimeout),
 			polexCache,
 			gcstore,
 		)
@@ -415,17 +473,17 @@ func main() {
 						time.Sleep(2 * time.Second)
 						continue
 					}
-					breaker.ReportsBreaker = breaker.NewBreaker("background scan reports", ephrCounterFunc(ephrs))
+					breaker.SetReportsBreaker(breaker.NewBreaker("background scan reports", ephrCounterFunc(ephrs)))
 					return
 				}
 			}()
 			// create a temporary breaker until the retrying goroutine succeeds
-			breaker.ReportsBreaker = breaker.NewBreaker("background scan reports", func(context.Context) bool {
+			breaker.SetReportsBreaker(breaker.NewBreaker("background scan reports", func(context.Context) bool {
 				return true
-			})
+			}))
 			// no error occurred, create a normal breaker
 		} else {
-			breaker.ReportsBreaker = breaker.NewBreaker("background scan reports", ephrCounterFunc(ephrs))
+			breaker.SetReportsBreaker(breaker.NewBreaker("background scan reports", ephrCounterFunc(ephrs)))
 		}
 
 		typeConverter := patch.NewTypeConverterManager(nil, setup.KubeClient.Discovery().OpenAPIV3())
@@ -471,6 +529,7 @@ func main() {
 					backgroundScanInterval,
 					gcstore,
 					typeConverter,
+					setup.RegistrySecretLister,
 				)
 				if err != nil {
 					logger.Error(err, "failed to create leader controllers")

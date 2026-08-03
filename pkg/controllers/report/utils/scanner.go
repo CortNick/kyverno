@@ -22,6 +22,7 @@ import (
 	engineapi "github.com/kyverno/kyverno/pkg/engine/api"
 	"github.com/kyverno/kyverno/pkg/engine/jmespath"
 	gctxstore "github.com/kyverno/kyverno/pkg/globalcontext/store"
+	imageverifycache "github.com/kyverno/kyverno/pkg/image/verification/cache"
 	"github.com/kyverno/kyverno/pkg/metrics"
 	reportutils "github.com/kyverno/kyverno/pkg/utils/report"
 	"go.uber.org/multierr"
@@ -35,6 +36,7 @@ import (
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apiserver/pkg/admission/plugin/policy/mutating/patch"
+	corev1listers "k8s.io/client-go/listers/core/v1"
 )
 
 type scanner struct {
@@ -43,6 +45,7 @@ type scanner struct {
 	config        config.Configuration
 	jp            jmespath.Interface
 	client        dclient.Interface
+	secretLister  corev1listers.SecretLister
 	gctxStore     gctxstore.Store
 	mapper        meta.RESTMapper
 	typeConverter patch.TypeConverterManager
@@ -75,6 +78,7 @@ func NewScanner(
 	client dclient.Interface,
 	gctxStore gctxstore.Store,
 	mapper meta.RESTMapper,
+	secretLister corev1listers.SecretLister,
 	typeConverter patch.TypeConverterManager,
 ) Scanner {
 	return &scanner{
@@ -85,6 +89,7 @@ func NewScanner(
 		client:        client,
 		gctxStore:     gctxStore,
 		mapper:        mapper,
+		secretLister:  secretLister,
 		typeConverter: typeConverter,
 	}
 }
@@ -120,15 +125,15 @@ func (s *scanner) ScanResource(
 	for _, policy := range policies {
 		if pol := policy.AsKyvernoPolicy(); pol != nil {
 			kpols = append(kpols, policy)
-		} else if pol := policy.AsValidatingPolicy(); pol != nil {
+		} else if pol := policy.AsValidatingPolicyLike(); pol != nil {
 			vpols = append(vpols, policy)
-		} else if pol := policy.AsImageValidatingPolicy(); pol != nil {
+		} else if pol := policy.AsImageValidatingPolicyLike(); pol != nil {
 			ivpols = append(ivpols, policy)
 		} else if pol := policy.AsValidatingAdmissionPolicy(); pol != nil {
 			vaps = append(vaps, policy)
 		} else if pol := policy.AsMutatingAdmissionPolicy(); pol != nil {
 			maps = append(maps, policy)
-		} else if pol := policy.AsMutatingPolicy(); pol != nil {
+		} else if pol := policy.AsMutatingPolicyLike(); pol != nil {
 			mpols = append(mpols, policy)
 		}
 	}
@@ -173,7 +178,7 @@ func (s *scanner) ScanResource(
 	}
 
 	for i, policy := range vpols {
-		if pol := policy.AsValidatingPolicy(); pol != nil {
+		if pol := policy.AsValidatingPolicyLike(); pol != nil {
 			compiler := vpolcompiler.NewCompiler()
 			provider, err := vpolengine.NewProvider(compiler, []policiesv1beta1.ValidatingPolicyLike{pol}, exceptions)
 			if err != nil {
@@ -187,22 +192,8 @@ func (s *scanner) ScanResource(
 				matching.NewMatcher(),
 			), metrics.BackgroundScan)
 
-			context, err := libs.NewContextProvider(
-				s.client,
-				nil,
-				// TODO
-				// []imagedataloader.Option{imagedataloader.WithLocalCredentials(c.RegistryAccess)},
-				s.gctxStore,
-				s.mapper,
-				false,
-			)
-			if err != nil {
-				logger.Error(err, "failed to create cel context provider")
-				results[&vpols[i]] = ScanResult{nil, err}
-				continue
-			}
 			request := celengine.Request(
-				context,
+				libs.GetLibsCtx(),
 				resource.GroupVersionKind(),
 				gvr,
 				subResource,
@@ -218,7 +209,7 @@ func (s *scanner) ScanResource(
 			engineResponse, err := engine.Handle(ctx, request, nil)
 			rules := make([]engineapi.RuleResponse, 0)
 			for _, policy := range engineResponse.Policies {
-				rules = append(rules, policy.Rules...)
+				rules = append(rules, filterMatchConditionSkips(policy.Rules)...)
 			}
 
 			response := engineapi.EngineResponse{
@@ -232,38 +223,25 @@ func (s *scanner) ScanResource(
 	}
 
 	for i, policy := range mpols {
-		if pol := policy.AsMutatingPolicy(); pol != nil {
+		if pol := policy.AsMutatingPolicyLike(); pol != nil {
 			compiler := mpolcompiler.NewCompiler()
-			provider, err := mpolengine.NewProvider(compiler, []policiesv1beta1.MutatingPolicyLike{pol}, exceptions)
+			provider, err := mpolengine.NewProvider(compiler, []policiesv1beta1.MutatingPolicyLike{pol}, exceptions, libs.GetLibsCtx())
 			if err != nil {
 				logger.Error(err, "failed to create policy provider")
 				results[&mpols[i]] = ScanResult{nil, err}
 				continue
 			}
-			context, err := libs.NewContextProvider(
-				s.client,
-				nil,
-				// TODO
-				// []imagedataloader.Option{imagedataloader.WithLocalCredentials(c.RegistryAccess)},
-				s.gctxStore,
-				s.mapper,
-				false,
-			)
+
 			engine := mpolengine.NewMetricWrapper(mpolengine.NewEngine(
 				provider,
 				func(name string) *corev1.Namespace { return ns },
 				matching.NewMatcher(),
 				s.typeConverter,
-				context,
+				libs.GetLibsCtx(),
 			), metrics.BackgroundScan)
 
-			if err != nil {
-				logger.Error(err, "failed to create cel context provider")
-				results[&mpols[i]] = ScanResult{nil, err}
-				continue
-			}
 			request := celengine.Request(
-				context,
+				libs.GetLibsCtx(),
 				resource.GroupVersionKind(),
 				gvr,
 				subResource,
@@ -301,7 +279,7 @@ func (s *scanner) ScanResource(
 	}
 
 	for i, policy := range ivpols {
-		if pol := policy.AsImageValidatingPolicy(); pol != nil {
+		if pol := policy.AsImageValidatingPolicyLike(); pol != nil {
 			provider, err := ivpolengine.NewProvider([]policiesv1beta1.ImageValidatingPolicyLike{pol}, exceptions)
 			if err != nil {
 				logger.Error(err, "failed to create image verification policy provider")
@@ -312,17 +290,12 @@ func (s *scanner) ScanResource(
 				provider,
 				func(name string) *corev1.Namespace { return ns },
 				matching.NewMatcher(),
-				s.client.GetKubeClient().CoreV1().Secrets(""),
-				nil,
+				s.secretLister,
+				imageverifycache.DisabledImageVerifyCache(),
+				s.config,
 			), metrics.BackgroundScan)
-			context, err := libs.NewContextProvider(s.client, nil, gctxstore.New(), s.mapper, false)
-			if err != nil {
-				logger.Error(err, "failed to create cel context provider")
-				results[&ivpols[i]] = ScanResult{nil, err}
-				continue
-			}
 			request := celengine.Request(
-				context,
+				libs.GetLibsCtx(),
 				resource.GroupVersionKind(),
 				gvr,
 				subResource,
@@ -335,7 +308,7 @@ func (s *scanner) ScanResource(
 				false,
 				nil,
 			)
-			engineResponse, _, err := engine.HandleMutating(ctx, request, nil)
+			engineResponse, err := engine.HandleValidating(ctx, request, nil)
 			response := engineapi.EngineResponse{
 				Resource:       resource,
 				PolicyResponse: engineapi.PolicyResponse{},
@@ -356,7 +329,7 @@ func (s *scanner) ScanResource(
 					policyData.AddBinding(binding)
 				}
 			}
-			res, err := admissionpolicy.Validate(policyData, resource, resource.GroupVersionKind(), gvr, map[string]map[string]string{}, s.client, nil, false)
+			res, err := admissionpolicy.Validate(policyData, resource, resource.GroupVersionKind(), gvr, map[string]map[string]string{}, s.client, &authenticationv1.UserInfo{}, false)
 			results[&vaps[i]] = ScanResult{&res, err}
 		}
 	}
@@ -368,7 +341,7 @@ func (s *scanner) ScanResource(
 					policyData.AddBinding(binding)
 				}
 			}
-			res, err := admissionpolicy.Mutate(policyData, resource, resource.GroupVersionKind(), gvr, map[string]map[string]string{}, s.client, nil, false, true)
+			res, err := admissionpolicy.Mutate(policyData, resource, resource.GroupVersionKind(), gvr, map[string]map[string]string{}, s.client, &authenticationv1.UserInfo{}, false, true)
 			results[&maps[i]] = ScanResult{&res, err}
 		}
 	}
@@ -396,6 +369,7 @@ func (s *scanner) validateImages(ctx context.Context, resource unstructured.Unst
 	if annotations != nil {
 		resource = *resource.DeepCopy()
 		delete(annotations, kyverno.AnnotationImageVerify)
+		delete(annotations, kyverno.AnnotationImageVerifyScoped)
 		resource.SetAnnotations(annotations)
 	}
 	policyCtx, err := engine.NewPolicyContext(s.jp, resource, kyvernov1.Create, nil, s.config)
@@ -420,4 +394,18 @@ func (s *scanner) checkResourceFilters(resource unstructured.Unstructured, subre
 		}
 	}
 	return true
+}
+
+// filterMatchConditionSkips removes RuleResponses that were skipped solely
+// because matchConditions evaluated to false. These are internal routing
+// signals and should not appear in PolicyReports.
+func filterMatchConditionSkips(rules []engineapi.RuleResponse) []engineapi.RuleResponse {
+	result := make([]engineapi.RuleResponse, 0, len(rules))
+	for _, r := range rules {
+		if r.Status() == engineapi.RuleStatusSkip && r.SkipReason() == engineapi.SkipReasonMatchConditions {
+			continue
+		}
+		result = append(result, r)
+	}
+	return result
 }

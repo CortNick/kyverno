@@ -14,6 +14,8 @@ import (
 	resourcehandlers "github.com/kyverno/kyverno/cmd/cleanup-controller/handlers/admission/resource"
 	"github.com/kyverno/kyverno/cmd/internal"
 	"github.com/kyverno/kyverno/pkg/auth/checker"
+	celcompiler "github.com/kyverno/kyverno/pkg/cel/compiler"
+	celengine "github.com/kyverno/kyverno/pkg/cel/engine"
 	"github.com/kyverno/kyverno/pkg/cel/libs"
 	"github.com/kyverno/kyverno/pkg/cel/matching"
 	"github.com/kyverno/kyverno/pkg/cel/policies/dpol/compiler"
@@ -27,7 +29,7 @@ import (
 	genericwebhookcontroller "github.com/kyverno/kyverno/pkg/controllers/generic/webhook"
 	globalcontextcontroller "github.com/kyverno/kyverno/pkg/controllers/globalcontext"
 	ttlcontroller "github.com/kyverno/kyverno/pkg/controllers/ttl"
-	webhookcontroller "github.com/kyverno/kyverno/pkg/controllers/webhook"
+	"github.com/kyverno/kyverno/pkg/engine/apicall"
 	"github.com/kyverno/kyverno/pkg/event"
 	"github.com/kyverno/kyverno/pkg/globalcontext/store"
 	"github.com/kyverno/kyverno/pkg/informers"
@@ -37,7 +39,6 @@ import (
 	"github.com/kyverno/kyverno/pkg/toggle"
 	kubeutils "github.com/kyverno/kyverno/pkg/utils/kube"
 	"github.com/kyverno/kyverno/pkg/utils/restmapper"
-	runtimeutils "github.com/kyverno/kyverno/pkg/utils/runtime"
 	"github.com/kyverno/kyverno/pkg/webhooks"
 	admissionregistrationv1 "k8s.io/api/admissionregistration/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -48,11 +49,9 @@ import (
 )
 
 const (
-	webhookWorkers                       = 2
-	policyWebhookControllerName          = "policy-webhook-controller"
-	ttlWebhookControllerName             = "ttl-webhook-controller"
-	policyWebhookControllerFinalizerName = "kyverno.io/policywebhooks"
-	ttlWebhookControllerFinalizerName    = "kyverno.io/ttlwebhooks"
+	webhookWorkers              = 2
+	policyWebhookControllerName = "policy-webhook-controller"
+	ttlWebhookControllerName    = "ttl-webhook-controller"
 )
 
 var (
@@ -81,16 +80,19 @@ func sanityChecks(apiserverClient apiserver.Interface) error {
 
 func main() {
 	var (
-		dumpPayload              bool
-		serverIP                 string
-		servicePort              int
-		webhookServerPort        int
-		maxQueuedEvents          int
-		interval                 time.Duration
-		renewBefore              time.Duration
-		maxAPICallResponseLength int64
-		autoDeleteWebhooks       bool
-		tlsKeyAlgorithm          string
+		dumpPayload                  bool
+		serverIP                     string
+		servicePort                  int
+		webhookServerPort            int
+		maxQueuedEvents              int
+		interval                     time.Duration
+		renewBefore                  time.Duration
+		maxAPICallResponseLength     int64
+		apiCallTimeout               time.Duration
+		autoDeleteWebhooks           bool
+		tlsKeyAlgorithm              string
+		maxGlobalContextEntries      int
+		disableCertManagerController bool
 	)
 	flagset := flag.NewFlagSet("cleanup-controller", flag.ExitOnError)
 	flagset.BoolVar(&dumpPayload, "dumpPayload", false, "Set this flag to activate/deactivate debug mode.")
@@ -101,12 +103,18 @@ func main() {
 	flagset.IntVar(&maxQueuedEvents, "maxQueuedEvents", 1000, "Maximum events to be queued.")
 	flagset.DurationVar(&interval, "ttlReconciliationInterval", time.Minute, "Set this flag to set the interval after which the resource controller reconciliation should occur")
 	flagset.Func(toggle.ProtectManagedResourcesFlagName, toggle.ProtectManagedResourcesDescription, toggle.ProtectManagedResources.Parse)
+	flagset.Func(toggle.AllowHTTPInNamespacedPoliciesFlagName, toggle.AllowHTTPInNamespacedPoliciesDescription, toggle.AllowHTTPInNamespacedPolicies.Parse)
+	flagset.Func(toggle.HTTPBlocklistFlagName, toggle.HTTPBlocklistDescription, toggle.HTTPBlocklist.Parse)
+	flagset.Func(toggle.HTTPAllowlistFlagName, toggle.HTTPAllowlistDescription, toggle.HTTPAllowlist.Parse)
 	flagset.StringVar(&caSecretName, "caSecretName", "", "Name of the secret containing CA.")
 	flagset.StringVar(&tlsSecretName, "tlsSecretName", "", "Name of the secret containing TLS pair.")
 	flagset.DurationVar(&renewBefore, "renewBefore", 15*24*time.Hour, "The certificate renewal time before expiration")
 	flagset.Int64Var(&maxAPICallResponseLength, "maxAPICallResponseLength", 2*1000*1000, "Maximum allowed response size from API Calls. A value of 0 bypasses checks (not recommended).")
+	flagset.DurationVar(&apiCallTimeout, "apiCallTimeout", 30*time.Second, "Timeout for HTTP API calls made by policies. A value of 0 means no timeout.")
 	flagset.BoolVar(&autoDeleteWebhooks, "autoDeleteWebhooks", false, "Set this flag to 'true' to enable autodeletion of webhook configurations using finalizers (requires extra permissions).")
 	flagset.StringVar(&tlsKeyAlgorithm, "tlsKeyAlgorithm", "RSA", "Key algorithm for self-signed TLS certificates (RSA, ECDSA, Ed25519)")
+	flagset.IntVar(&maxGlobalContextEntries, "maxGlobalContextEntries", 0, "Maximum number of entries in the global context store. When the limit is reached, new entries are rejected and retried. A value of 0 means unbounded.")
+	flagset.BoolVar(&disableCertManagerController, "disableCertManagerController", false, "Disable the in-process certificate manager controller.")
 	// config
 	appConfig := internal.NewConfiguration(
 		internal.WithProfiling(),
@@ -126,6 +134,12 @@ func main() {
 	)
 	// parse flags
 	internal.ParseFlags(appConfig)
+	apicall.SetScopedTokenClientTimeout(apiCallTimeout)
+	// Validate HTTP blocklist/allowlist flags at startup (fail-fast).
+	if err := celcompiler.ValidateHTTPFlags(); err != nil {
+		fmt.Fprintf(os.Stderr, "invalid HTTP flag configuration: %v\n", err)
+		os.Exit(1)
+	}
 	var wg wait.Group
 	func() {
 		// setup
@@ -190,7 +204,7 @@ func main() {
 			eventGenerator,
 			event.Workers,
 		)
-		gcstore := store.New()
+		gcstore := store.New(maxGlobalContextEntries)
 		gceController := internal.NewController(
 			globalcontextcontroller.ControllerName,
 			globalcontextcontroller.NewController(
@@ -201,6 +215,7 @@ func main() {
 				gcstore,
 				eventGenerator,
 				maxAPICallResponseLength,
+				apiCallTimeout,
 				false,
 				setup.Jp,
 			),
@@ -210,20 +225,13 @@ func main() {
 		if !internal.StartInformersAndWaitForCacheSync(ctx, setup.Logger, kubeInformer, kyvernoInformer) {
 			os.Exit(1)
 		}
-		runtime := runtimeutils.NewRuntime(
-			setup.Logger.WithName("runtime-checks"),
-			serverIP,
-			kyvernoDeployment,
-			nil,
-		)
-
-		restMapper, err := restmapper.GetRESTMapper(setup.KyvernoDynamicClient, false)
+		restMapper, err := restmapper.GetRESTMapper(setup.KyvernoDynamicClient)
 		if err != nil {
 			setup.Logger.Error(err, "failed to create RESTMapper")
 			os.Exit(1)
 		}
 
-		libCtx, err := libs.NewContextProvider(setup.KyvernoDynamicClient, nil, gcstore, restMapper, false)
+		libCtx, err := libs.NewContextProvider(setup.KyvernoDynamicClient, setup.RegistrySecretLister, gcstore, restMapper, false)
 		if err != nil {
 			setup.Logger.Error(err, "failed to create CEL context provider")
 			os.Exit(1)
@@ -248,7 +256,7 @@ func main() {
 					compiler.NewCompiler(),
 					kyvernoInformer.Policies().V1beta1().DeletingPolicies().Lister(),
 					kyvernoInformer.Policies().V1beta1().NamespacedDeletingPolicies().Lister(),
-					kyvernoInformer.Policies().V1beta1().PolicyExceptions().Lister(),
+					celengine.NewPolicyExceptionLister(kyvernoInformer.Policies().V1beta1().PolicyExceptions().Lister(), internal.ExceptionNamespace()),
 					internal.PolicyExceptionEnabled(),
 				)
 
@@ -267,18 +275,21 @@ func main() {
 					tlsSecretName,
 					keyAlgorithm,
 				)
-				certController := internal.NewController(
-					certmanager.ControllerName,
-					certmanager.NewController(
-						caSecret,
-						tlsSecret,
-						renewer,
-						caSecretName,
-						tlsSecretName,
-						config.KyvernoNamespace(),
-					),
-					certmanager.Workers,
-				)
+				var certController internal.Controller
+				if !disableCertManagerController {
+					certController = internal.NewController(
+						certmanager.ControllerName,
+						certmanager.NewController(
+							caSecret,
+							tlsSecret,
+							renewer,
+							caSecretName,
+							tlsSecretName,
+							config.KyvernoNamespace(),
+						),
+						certmanager.Workers,
+					)
+				}
 				policyValidatingWebhookController := internal.NewController(
 					policyWebhookControllerName,
 					genericwebhookcontroller.NewController(
@@ -286,7 +297,6 @@ func main() {
 						setup.KubeClient.AdmissionregistrationV1().ValidatingWebhookConfigurations(),
 						kubeInformer.Admissionregistration().V1().ValidatingWebhookConfigurations(),
 						caSecret,
-						kyvernoDeployment,
 						config.CleanupValidatingWebhookConfigurationName,
 						config.CleanupValidatingWebhookServicePath,
 						serverIP,
@@ -312,10 +322,6 @@ func main() {
 						genericwebhookcontroller.None,
 						setup.Configuration,
 						caSecretName,
-						runtime,
-						autoDeleteWebhooks,
-						webhookcontroller.WebhookCleanupSetup(setup.KubeClient, policyWebhookControllerFinalizerName),
-						webhookcontroller.WebhookCleanupHandler(setup.KubeClient, policyWebhookControllerFinalizerName),
 					),
 					webhookWorkers,
 				)
@@ -326,7 +332,6 @@ func main() {
 						setup.KubeClient.AdmissionregistrationV1().ValidatingWebhookConfigurations(),
 						kubeInformer.Admissionregistration().V1().ValidatingWebhookConfigurations(),
 						caSecret,
-						kyvernoDeployment,
 						config.TtlValidatingWebhookConfigurationName,
 						config.TtlValidatingWebhookServicePath,
 						serverIP,
@@ -356,10 +361,6 @@ func main() {
 						genericwebhookcontroller.None,
 						setup.Configuration,
 						caSecretName,
-						runtime,
-						autoDeleteWebhooks,
-						webhookcontroller.WebhookCleanupSetup(setup.KubeClient, ttlWebhookControllerFinalizerName),
-						webhookcontroller.WebhookCleanupHandler(setup.KubeClient, ttlWebhookControllerFinalizerName),
 					),
 					webhookWorkers,
 				)
@@ -388,13 +389,7 @@ func main() {
 						kyvernoInformer.Policies().V1beta1().NamespacedDeletingPolicies(),
 						provider,
 						engine.NewEngine(
-							func(name string) *corev1.Namespace {
-								ns, err := nsLister.Get(name)
-								if err != nil {
-									return nil
-								}
-								return ns
-							},
+							celengine.NewNamespaceResolver(logger.WithName("ns-resolver"), nsLister, setup.KubeClient),
 							restMapper,
 							libCtx,
 							matching.NewMatcher(),
@@ -424,7 +419,9 @@ func main() {
 				}
 				// start leader controllers
 				var wg wait.Group
-				certController.Run(ctx, logger, &wg)
+				if certController != nil {
+					certController.Run(ctx, logger, &wg)
+				}
 				policyValidatingWebhookController.Run(ctx, logger, &wg)
 				ttlWebhookController.Run(ctx, logger, &wg)
 				cleanupController.Run(ctx, logger, &wg)

@@ -9,8 +9,8 @@ import (
 	"github.com/kyverno/kyverno/pkg/cel/libs"
 	"github.com/kyverno/kyverno/pkg/clients/dclient"
 	gctxstore "github.com/kyverno/kyverno/pkg/globalcontext/store"
-	"github.com/kyverno/kyverno/pkg/imageverification/imagedataloader"
 	"k8s.io/apimachinery/pkg/api/meta"
+	"k8s.io/client-go/informers"
 )
 
 func policyHasValidateOrVerifyImageChecks(policy kyvernov1.PolicyInterface) bool {
@@ -23,12 +23,23 @@ func policyHasValidateOrVerifyImageChecks(policy kyvernov1.PolicyInterface) bool
 	return false
 }
 
-func NewContextProvider(dclient dclient.Interface, restMapper meta.RESTMapper, f billy.Filesystem, contextPath string, registryAccess bool, isFake bool) (libs.Context, error) {
+func NewContextProvider(dclient dclient.Interface, restMapper meta.RESTMapper, f billy.Filesystem, contextPath string, registryAccess bool, isFake bool, globalContextEntries map[string]interface{}, httpMockIndex map[string]interface{}) (libs.Context, error) {
 	if dclient != nil && !isFake {
+		kubeClient := dclient.GetKubeClient()
+		informerFactory := informers.NewSharedInformerFactory(kubeClient, 0)
+
+		// TODO: informer exit, we rely on the fact that this is gonna be used in the cli
+		// so the context and the informer will just die at the end of the command execution.
+		// but maybe we can do better ?
+		stopCh := make(chan struct{})
+		informerFactory.Start(stopCh)
+		informerFactory.WaitForCacheSync(stopCh)
+
+		lister := informerFactory.Core().V1().Secrets().Lister()
 		return libs.NewContextProvider(
 			dclient,
-			[]imagedataloader.Option{imagedataloader.WithLocalCredentials(registryAccess)},
-			gctxstore.New(),
+			lister,
+			gctxstore.New(0),
 			restMapper,
 			true,
 		)
@@ -63,5 +74,17 @@ func NewContextProvider(dclient dclient.Interface, restMapper meta.RESTMapper, f
 			fakeContextProvider.AddImageData(imgData.Image, asMap)
 		}
 	}
+
+	if len(globalContextEntries) > 0 {
+		for name, data := range globalContextEntries {
+			fakeContextProvider.AddGlobalReference(name, data)
+		}
+	}
+
+	if len(httpMockIndex) > 0 {
+		fakeContextProvider.SetHTTPMocks(httpMockIndex)
+	}
+
+	libs.LibraryContext = fakeContextProvider
 	return fakeContextProvider, nil
 }

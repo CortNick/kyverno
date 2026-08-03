@@ -12,20 +12,24 @@ import (
 	mpolvalidation "github.com/kyverno/kyverno/pkg/cel/policies/mpol"
 	vpolvalidation "github.com/kyverno/kyverno/pkg/cel/policies/vpol"
 	"github.com/kyverno/kyverno/pkg/clients/dclient"
-	eval "github.com/kyverno/kyverno/pkg/imageverification/evaluator"
+	"github.com/kyverno/kyverno/pkg/deprecations"
+	eval "github.com/kyverno/kyverno/pkg/image/verification/evaluator"
 	admissionutils "github.com/kyverno/kyverno/pkg/utils/admission"
 	policyvalidate "github.com/kyverno/kyverno/pkg/validation/policy"
 	"github.com/kyverno/kyverno/pkg/webhooks/handlers"
+	corev1listers "k8s.io/client-go/listers/core/v1"
 )
 
 type policyHandlers struct {
 	client                       dclient.Interface
+	secretLister                 corev1listers.SecretLister
 	backgroundServiceAccountName string
 	reportsServiceAccountName    string
 }
 
-func NewHandlers(client dclient.Interface, backgroundSA, reportsSA string) *policyHandlers {
+func NewHandlers(client dclient.Interface, secretLister corev1listers.SecretLister, backgroundSA, reportsSA string) *policyHandlers {
 	return &policyHandlers{
+		secretLister:                 secretLister,
 		client:                       client,
 		backgroundServiceAccountName: backgroundSA,
 		reportsServiceAccountName:    reportsSA,
@@ -39,7 +43,7 @@ func (h *policyHandlers) Validate(ctx context.Context, logger logr.Logger, reque
 		return admissionutils.Response(request.UID, err)
 	}
 
-	if vpol := policy.AsValidatingPolicy(); vpol != nil {
+	if vpol := policy.AsValidatingPolicyLike(); vpol != nil {
 		warnings, err := vpolvalidation.Validate(vpol)
 		if err != nil {
 			logger.Error(err, "ValidatingPolicy validation errors")
@@ -47,31 +51,15 @@ func (h *policyHandlers) Validate(ctx context.Context, logger logr.Logger, reque
 		return admissionutils.Response(request.UID, err, warnings...)
 	}
 
-	if nvpol := policy.AsNamespacedValidatingPolicy(); nvpol != nil {
-		warnings, err := vpolvalidation.Validate(nvpol)
-		if err != nil {
-			logger.Error(err, "NamespacedValidatingPolicy validation errors")
-		}
-		return admissionutils.Response(request.UID, err, warnings...)
-	}
-
-	if ivpol := policy.AsImageValidatingPolicy(); ivpol != nil {
-		warnings, err := eval.Validate(ivpol, h.client.GetKubeClient().CoreV1().Secrets(""))
+	if ivpol := policy.AsImageValidatingPolicyLike(); ivpol != nil {
+		warnings, err := eval.Validate(ivpol, h.secretLister)
 		if err != nil {
 			logger.Error(err, "ImageValidatingPolicy validation errors")
 		}
 		return admissionutils.Response(request.UID, err, warnings...)
 	}
 
-	if nivpol := policy.AsNamespacedImageValidatingPolicy(); nivpol != nil {
-		warnings, err := eval.Validate(policy.AsNamespacedImageValidatingPolicy(), h.client.GetKubeClient().CoreV1().Secrets(""))
-		if err != nil {
-			logger.Error(err, "NamespacedImageValidatingPolicy validation errors")
-		}
-		return admissionutils.Response(request.UID, err, warnings...)
-	}
-
-	if mpol := policy.AsMutatingPolicy(); mpol != nil {
+	if mpol := policy.AsMutatingPolicyLike(); mpol != nil {
 		warnings, err := mpolvalidation.Validate(mpol)
 		if err != nil {
 			logger.Error(err, "MutatingPolicy validation errors")
@@ -79,26 +67,10 @@ func (h *policyHandlers) Validate(ctx context.Context, logger logr.Logger, reque
 		return admissionutils.Response(request.UID, err, warnings...)
 	}
 
-	if nmpol := policy.AsNamespacedMutatingPolicy(); nmpol != nil {
-		warnings, err := mpolvalidation.Validate(nmpol)
-		if err != nil {
-			logger.Error(err, "NamespacedMutatingPolicy validation errors")
-		}
-		return admissionutils.Response(request.UID, err, warnings...)
-	}
-
-	if gpol := policy.AsGeneratingPolicy(); gpol != nil {
+	if gpol := policy.AsGeneratingPolicyLike(); gpol != nil {
 		warnings, err := gpolvalidation.Validate(gpol)
 		if err != nil {
 			logger.Error(err, "GeneratingPolicy validation errors")
-		}
-		return admissionutils.Response(request.UID, err, warnings...)
-	}
-
-	if ngpol := policy.AsNamespacedGeneratingPolicy(); ngpol != nil {
-		warnings, err := gpolvalidation.Validate(ngpol)
-		if err != nil {
-			logger.Error(err, "NamespacedGeneratingPolicy validation errors")
 		}
 		return admissionutils.Response(request.UID, err, warnings...)
 	}
@@ -120,6 +92,10 @@ func (h *policyHandlers) Validate(ctx context.Context, logger logr.Logger, reque
 		warnings, err := policyvalidate.Validate(policy.AsKyvernoPolicy(), old, h.client, false, h.backgroundServiceAccountName, h.reportsServiceAccountName)
 		if err != nil {
 			logger.Error(err, "policy validation errors")
+		}
+		if warning := deprecations.Warning(request.Kind.Kind); warning != "" {
+			logger.V(2).Info(warning, "kind", request.Kind.Kind, "namespace", request.Namespace, "name", request.Name)
+			warnings = append(warnings, warning)
 		}
 		return admissionutils.Response(request.UID, err, warnings...)
 	}

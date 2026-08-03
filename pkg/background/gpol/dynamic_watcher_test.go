@@ -7,6 +7,7 @@ import (
 	"io"
 	"sync"
 	"testing"
+	"time"
 
 	v1 "github.com/kyverno/kyverno/api/kyverno/v1"
 	"github.com/kyverno/kyverno/pkg/background/common"
@@ -14,6 +15,7 @@ import (
 	"github.com/kyverno/kyverno/pkg/logging"
 	reportutils "github.com/kyverno/kyverno/pkg/utils/report"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -172,7 +174,10 @@ func TestSyncWatchers(t *testing.T) {
 		{
 			name: "Watcher already exist path",
 			setupWM: func() *WatchManager {
-				existing := &watcher{metadataCache: map[types.UID]Resource{}}
+				existing := &watcher{
+					watcher:       watch.MockWatcher{StopFunc: func() {}},
+					metadataCache: map[types.UID]Resource{},
+				}
 				return &WatchManager{
 					log:    logging.WithName("test"),
 					client: &MockClient{},
@@ -252,7 +257,7 @@ func TestSyncWatchers(t *testing.T) {
 					log: logging.WithName("test"),
 					client: &MockClient{
 						deleteFn: func(ctx context.Context, apiVersion, kind, namespace, name string, dryRun bool, options metav1.DeleteOptions) error {
-							fmt.Printf("Mock delete %s/%s in %s\n", kind, name, namespace)
+							// Mock delete operation - no logging needed for test mock
 							return nil
 						},
 					},
@@ -330,6 +335,22 @@ func TestSyncWatchers(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestSyncWatchers_StaleRefCountRemovedWhenWatcherMissing(t *testing.T) {
+	oldGVR := schema.GroupVersionResource{Group: "old", Version: "v1", Resource: "res"}
+	wm := &WatchManager{
+		log:             logging.WithName("test"),
+		client:          &MockClient{},
+		dynamicWatchers: map[schema.GroupVersionResource]*watcher{},
+		policyRefs:      map[string][]schema.GroupVersionResource{"pol1": {oldGVR}},
+		refCount:        map[schema.GroupVersionResource]int{oldGVR: 1},
+	}
+
+	err := wm.SyncWatchers("pol1", nil)
+	require.NoError(t, err)
+	_, exists := wm.refCount[oldGVR]
+	assert.False(t, exists)
 }
 
 func TestWatchManager_GetDownstreams(t *testing.T) {
@@ -609,6 +630,102 @@ func TestDeleteDownstreams(t *testing.T) {
 	}
 }
 
+func TestCleanupStaleDownstreams(t *testing.T) {
+	makeCached := func(obj *unstructured.Unstructured, labels map[string]string) Resource {
+		obj.SetLabels(labels)
+		return Resource{
+			Name:      obj.GetName(),
+			Namespace: obj.GetNamespace(),
+			Labels:    labels,
+			Data:      obj,
+		}
+	}
+
+	gvr1 := schema.GroupVersionResource{Group: "", Version: "v1", Resource: "configmaps"}
+	triggerUID := types.UID("trigger-123")
+	managedLabels := map[string]string{
+		common.GeneratePolicyLabel:     "p1",
+		common.GenerateTriggerUIDLabel: string(triggerUID),
+	}
+	otherTriggerLabels := map[string]string{
+		common.GeneratePolicyLabel:     "p1",
+		common.GenerateTriggerUIDLabel: "other-uid",
+	}
+
+	tests := []struct {
+		name           string
+		desired        []*unstructured.Unstructured
+		dynamicW       map[schema.GroupVersionResource]*watcher
+		wantDeleted    []string
+		wantCacheSizes map[schema.GroupVersionResource]int
+	}{
+		{
+			name:    "still desired resource is kept",
+			desired: []*unstructured.Unstructured{makeUnstructured("", "", "v1", "ConfigMap", "cm1", "ns1", "uid1", managedLabels)},
+			dynamicW: map[schema.GroupVersionResource]*watcher{
+				gvr1: {metadataCache: map[types.UID]Resource{
+					"uid1": makeCached(makeUnstructured("", "", "v1", "ConfigMap", "cm1", "ns1", "uid1", managedLabels), managedLabels),
+				}},
+			},
+			wantDeleted:    nil,
+			wantCacheSizes: map[schema.GroupVersionResource]int{gvr1: 1},
+		},
+		{
+			name:    "empty desired set deletes trigger downstreams only",
+			desired: nil,
+			dynamicW: map[schema.GroupVersionResource]*watcher{
+				gvr1: {metadataCache: map[types.UID]Resource{
+					"uid1": makeCached(makeUnstructured("", "", "v1", "ConfigMap", "cm1", "ns1", "uid1", managedLabels), managedLabels),
+					"uid2": makeCached(makeUnstructured("", "", "v1", "ConfigMap", "cm2", "ns2", "uid2", otherTriggerLabels), otherTriggerLabels),
+				}},
+			},
+			wantDeleted:    []string{"ConfigMap/ns1/cm1"},
+			wantCacheSizes: map[schema.GroupVersionResource]int{gvr1: 1},
+		},
+		{
+			name:    "renamed downstream deletes stale one",
+			desired: []*unstructured.Unstructured{makeUnstructured("", "", "v1", "ConfigMap", "cm-new", "ns1", "uid-new", managedLabels)},
+			dynamicW: map[schema.GroupVersionResource]*watcher{
+				gvr1: {metadataCache: map[types.UID]Resource{
+					"uid1": makeCached(makeUnstructured("", "", "v1", "ConfigMap", "cm-old", "ns1", "uid1", managedLabels), managedLabels),
+				}},
+			},
+			wantDeleted:    []string{"ConfigMap/ns1/cm-old"},
+			wantCacheSizes: map[schema.GroupVersionResource]int{gvr1: 0},
+		},
+		{
+			name:    "unmanaged resource is not deleted",
+			desired: nil,
+			dynamicW: map[schema.GroupVersionResource]*watcher{
+				gvr1: {metadataCache: map[types.UID]Resource{
+					"uid1": makeCached(makeUnstructured("", "", "v1", "ConfigMap", "cm1", "ns1", "uid1", map[string]string{"foo": "bar"}), map[string]string{"foo": "bar"}),
+				}},
+			},
+			wantDeleted:    nil,
+			wantCacheSizes: map[schema.GroupVersionResource]int{gvr1: 1},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			client := &MockClient{}
+			wm := &WatchManager{
+				policyRefs:      map[string][]schema.GroupVersionResource{"p1": {gvr1}},
+				dynamicWatchers: tt.dynamicW,
+				client:          client,
+				log:             logging.WithName("test"),
+			}
+
+			wm.CleanupStaleDownstreams("p1", &v1.ResourceSpec{UID: triggerUID}, tt.desired)
+
+			assert.ElementsMatch(t, tt.wantDeleted, client.deleted)
+			for gvr, wantSize := range tt.wantCacheSizes {
+				assert.Equal(t, wantSize, len(wm.dynamicWatchers[gvr].metadataCache))
+			}
+		})
+	}
+}
+
 func TestRemoveWatchersForPolicy(t *testing.T) {
 	gvr := schema.GroupVersionResource{Group: "", Version: "v1", Resource: "pods"}
 
@@ -753,6 +870,24 @@ func TestRemoveWatchersForPolicy(t *testing.T) {
 	}
 }
 
+func TestRemoveWatchersForPolicy_StaleRefCountRemovedWhenWatcherMissing(t *testing.T) {
+	gvr := schema.GroupVersionResource{Group: "", Version: "v1", Resource: "pods"}
+	wm := &WatchManager{
+		log:             logging.WithName("test"),
+		client:          &MockClient{},
+		dynamicWatchers: map[schema.GroupVersionResource]*watcher{},
+		policyRefs:      map[string][]schema.GroupVersionResource{"pol1": {gvr}},
+		refCount:        map[schema.GroupVersionResource]int{gvr: 1},
+	}
+
+	wm.RemoveWatchersForPolicy("pol1", true)
+
+	_, refExists := wm.refCount[gvr]
+	assert.False(t, refExists)
+	_, policyRefExists := wm.policyRefs["pol1"]
+	assert.False(t, policyRefExists)
+}
+
 type mockStopper struct {
 	stopped bool
 }
@@ -792,6 +927,153 @@ func TestStopWatchers(t *testing.T) {
 	assert.Empty(t, wm.dynamicWatchers, "Expected dynamicWatchers to be empty")
 	assert.Empty(t, wm.policyRefs, "Expected policyRefs to be empty")
 	assert.Empty(t, wm.refCount, "Expected refCount to be empty")
+}
+
+func TestHandleDelete_SourceDeleted(t *testing.T) {
+	gvr := schema.GroupVersionResource{Group: "", Version: "v1", Resource: "networkpolicies"}
+
+	makeSource := func(uid, name, ns string) *unstructured.Unstructured {
+		u := &unstructured.Unstructured{}
+		u.SetAPIVersion("v1")
+		u.SetKind("Namespace")
+		u.SetUID(types.UID(uid))
+		u.SetName(name)
+		u.SetNamespace(ns)
+		// No kyverno managed-by label — this is a source resource.
+		return u
+	}
+
+	makeDownstream := func(uid, name, ns, sourceUID string) *unstructured.Unstructured {
+		u := &unstructured.Unstructured{}
+		u.SetAPIVersion("networking.k8s.io/v1")
+		u.SetKind("NetworkPolicy")
+		u.SetUID(types.UID(uid))
+		u.SetName(name)
+		u.SetNamespace(ns)
+		u.SetLabels(map[string]string{common.GenerateSourceUIDLabel: sourceUID})
+		return u
+	}
+
+	tests := []struct {
+		name          string
+		deleteErr     error
+		wantCacheSize int
+	}{
+		{
+			name:          "delete succeeds: downstream removed from cache",
+			deleteErr:     nil,
+			wantCacheSize: 0,
+		},
+		{
+			name:          "delete fails: downstream must remain in cache",
+			deleteErr:     fmt.Errorf("permission denied"),
+			wantCacheSize: 1,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			downstream := makeDownstream("down-uid", "np-default", "default", "src-uid")
+
+			mockClient := &MockClient{
+				err: tt.deleteErr,
+				// ListResource returns the downstream so handleDelete can find it.
+				// The mock ListResource always returns a fixed item; override here
+				// to return our downstream.
+			}
+			// Override ListResource to return the downstream keyed by source UID.
+			_ = mockClient
+
+			// Build a WatchManager whose watcher for gvr tracks the downstream.
+			w := &watcher{
+				metadataCache: map[types.UID]Resource{
+					"down-uid": {
+						Name:      downstream.GetName(),
+						Namespace: downstream.GetNamespace(),
+						Labels:    downstream.GetLabels(),
+						Data:      downstream,
+					},
+				},
+			}
+
+			// We need ListResource to return our downstream. The default MockClient
+			// always returns a single blank item, which won't match "down-uid" in the
+			// cache check. Use a custom deleteFn-style mock for the list instead by
+			// constructing a specialised client inline.
+			type listAndDeleteClient struct {
+				MockClient
+				listFn func() (*unstructured.UnstructuredList, error)
+			}
+
+			specialClient := &MockClient{
+				deleteFn: func(ctx context.Context, apiVersion, kind, namespace, name string, dryRun bool, options metav1.DeleteOptions) error {
+					return tt.deleteErr
+				},
+			}
+			// Patch ListResource on the WatchManager directly using a closure client.
+			_ = specialClient
+
+			// Use a simpler approach: build the WatchManager and call handleDelete
+			// with a pre-seeded metadataCache that already contains the downstream.
+			// handleDelete's source path calls ListResource to find downstreams; we
+			// need the list to return "down-uid". The default MockClient.ListResource
+			// returns a blank Unstructured (empty UID), so the cache lookup at line
+			// 490 returns !exists → the downstream is skipped.
+			//
+			// To exercise the delete path, use a MockClient whose ListResource returns
+			// the real downstream object.
+			realClient := &struct {
+				MockClient
+			}{}
+			realClient.MockClient = MockClient{
+				deleteFn: func(ctx context.Context, apiVersion, kind, namespace, name string, dryRun bool, options metav1.DeleteOptions) error {
+					return tt.deleteErr
+				},
+			}
+
+			wm := &WatchManager{
+				log:    logging.WithName("test"),
+				client: &realClient.MockClient,
+				dynamicWatchers: map[schema.GroupVersionResource]*watcher{
+					gvr: w,
+				},
+			}
+
+			// Override ListResource to return the downstream so that handleDelete
+			// finds it and attempts to delete it. We achieve this by seeding the
+			// mock's return value via a custom listFn wrapper. Since MockClient
+			// does not support per-call list overrides, we test handleDelete directly
+			// with a MockClient that returns our downstream from ListResource by
+			// temporarily replacing the client on the WatchManager.
+			listClient := &fullMockClient{
+				listResult: &unstructured.UnstructuredList{Items: []unstructured.Unstructured{*downstream}},
+				deleteErr:  tt.deleteErr,
+			}
+			wm.client = listClient
+
+			src := makeSource("src-uid", "prod-ns", "")
+			wm.handleDelete(src, gvr)
+
+			assert.Equal(t, tt.wantCacheSize, len(w.metadataCache),
+				"metadataCache size after handleDelete with deleteErr=%v", tt.deleteErr)
+		})
+	}
+}
+
+// fullMockClient is a purpose-built mock that allows controlling both
+// ListResource and DeleteResource return values independently.
+type fullMockClient struct {
+	MockClient
+	listResult *unstructured.UnstructuredList
+	deleteErr  error
+}
+
+func (f *fullMockClient) ListResource(_ context.Context, _, _, _ string, _ *metav1.LabelSelector) (*unstructured.UnstructuredList, error) {
+	return f.listResult, nil
+}
+
+func (f *fullMockClient) DeleteResource(_ context.Context, _, _, _, _ string, _ bool, _ metav1.DeleteOptions) error {
+	return f.deleteErr
 }
 
 func TestHandleAdd(t *testing.T) {
@@ -968,4 +1250,85 @@ func TestWatchManager_CacheIntegrity(t *testing.T) {
 			assert.False(t, ts.IsZero(), "cached CreationTimestamp must not be zeroed")
 		})
 	}
+}
+
+func TestWatcherCleanup_DeadWatcherMarkedStoppedOnExit(t *testing.T) {
+	testGVR := schema.GroupVersionResource{Group: "g", Version: "v1", Resource: "res"}
+	wm := &WatchManager{
+		log:    logging.WithName("test"),
+		client: dclient.NewEmptyFakeClient(),
+		restMapper: &mockRESTMapper{
+			fn: func(gk schema.GroupKind, version string) (*meta.RESTMapping, error) {
+				return &meta.RESTMapping{Resource: testGVR}, nil
+			},
+		},
+		dynamicWatchers: make(map[schema.GroupVersionResource]*watcher),
+		policyRefs:      make(map[string][]schema.GroupVersionResource),
+		refCount:        make(map[schema.GroupVersionResource]int),
+	}
+
+	resource := makeUnstructured("1", "g", "v1", "Kind", "n", "ns", "uid1", nil)
+	err := wm.SyncWatchers("test-policy", []*unstructured.Unstructured{resource})
+	require.NoError(t, err)
+
+	wm.lock.Lock()
+	w, exists := wm.dynamicWatchers[testGVR]
+	wm.lock.Unlock()
+	require.True(t, exists)
+
+	w.watcher.Stop()
+
+	require.Eventually(t, func() bool {
+		wm.lock.Lock()
+		defer wm.lock.Unlock()
+		existing, stillExists := wm.dynamicWatchers[testGVR]
+		return stillExists && existing.watcher == nil
+	}, 2*time.Second, 10*time.Millisecond)
+}
+
+func TestWatcherCleanup_RestartPreservesMetadataCache(t *testing.T) {
+	testGVR := schema.GroupVersionResource{Group: "g", Version: "v1", Resource: "res"}
+	wm := &WatchManager{
+		log:    logging.WithName("test"),
+		client: dclient.NewEmptyFakeClient(),
+		restMapper: &mockRESTMapper{
+			fn: func(gk schema.GroupKind, version string) (*meta.RESTMapping, error) {
+				return &meta.RESTMapping{Resource: testGVR}, nil
+			},
+		},
+		dynamicWatchers: make(map[schema.GroupVersionResource]*watcher),
+		policyRefs:      make(map[string][]schema.GroupVersionResource),
+		refCount:        make(map[schema.GroupVersionResource]int),
+	}
+
+	first := makeUnstructured("1", "g", "v1", "Kind", "n1", "ns", "uid1", nil)
+	err := wm.SyncWatchers("test-policy", []*unstructured.Unstructured{first})
+	require.NoError(t, err)
+
+	wm.lock.Lock()
+	w := wm.dynamicWatchers[testGVR]
+	wm.lock.Unlock()
+	require.NotNil(t, w)
+	w.watcher.Stop()
+
+	require.Eventually(t, func() bool {
+		wm.lock.Lock()
+		defer wm.lock.Unlock()
+		existing, ok := wm.dynamicWatchers[testGVR]
+		return ok && existing.watcher == nil
+	}, 2*time.Second, 10*time.Millisecond)
+
+	second := makeUnstructured("2", "g", "v1", "Kind", "n2", "ns", "uid2", nil)
+	err = wm.SyncWatchers("test-policy", []*unstructured.Unstructured{second})
+	require.NoError(t, err)
+
+	wm.lock.Lock()
+	defer wm.lock.Unlock()
+	restarted := wm.dynamicWatchers[testGVR]
+	require.NotNil(t, restarted)
+	require.NotNil(t, restarted.watcher)
+	_, hasFirst := restarted.metadataCache["uid1"]
+	_, hasSecond := restarted.metadataCache["uid2"]
+	assert.True(t, hasFirst)
+	assert.True(t, hasSecond)
 }

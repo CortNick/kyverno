@@ -84,11 +84,20 @@ func (rc *ResultCounts) addGenerateResponse(response engineapi.EngineResponse) {
 				}
 			}
 		}
-	} else if gpol := genericPolicy.AsGeneratingPolicy(); gpol != nil {
+	} else if gpol := genericPolicy.AsGeneratingPolicyLike(); gpol != nil {
 		for _, ruleResponse := range response.PolicyResponse.Rules {
-			if ruleResponse.Status() == engineapi.RuleStatusPass {
+			switch ruleResponse.Status() {
+			case engineapi.RuleStatusPass:
 				rc.Pass++
-			} else if ruleResponse.Status() == engineapi.RuleStatusFail {
+			case engineapi.RuleStatusFail:
+				rc.Fail++
+			case engineapi.RuleStatusWarn:
+				rc.Warn++
+			case engineapi.RuleStatusSkip:
+				rc.Skip++
+			case engineapi.RuleStatusError:
+				rc.Error++
+			default:
 				rc.Fail++
 			}
 		}
@@ -151,7 +160,7 @@ func (rc *ResultCounts) addMutateResponse(response engineapi.EngineResponse) boo
 	}
 
 	// Handle MutatingPolicies
-	if policy := genericPolicy.AsMutatingPolicy(); policy != nil {
+	if policy := genericPolicy.AsMutatingPolicyLike(); policy != nil {
 		for _, rule := range response.PolicyResponse.Rules {
 			switch rule.Status() {
 			case engineapi.RuleStatusPass:

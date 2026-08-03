@@ -8,12 +8,12 @@ import (
 )
 
 // this file contains the handler functions for MutatingPolicy resources.
-func (c *controller) addMP(obj *policiesv1beta1.MutatingPolicy) {
+func (c *controller) addMP(obj policiesv1beta1.MutatingPolicyLike) {
 	logger.V(2).Info("mutating policy created", "uid", obj.GetUID(), "kind", obj.GetKind(), "name", obj.GetName())
 	c.enqueueMP(obj)
 }
 
-func (c *controller) updateMP(old, obj *policiesv1beta1.MutatingPolicy) {
+func (c *controller) updateMP(old, obj policiesv1beta1.MutatingPolicyLike) {
 	if datautils.DeepEqual(old.GetSpec(), obj.GetSpec()) {
 		return
 	}
@@ -21,14 +21,25 @@ func (c *controller) updateMP(old, obj *policiesv1beta1.MutatingPolicy) {
 	c.enqueueMP(obj)
 }
 
-func (c *controller) deleteMP(obj *policiesv1beta1.MutatingPolicy) {
-	mpol := kubeutils.GetObjectWithTombstone(obj).(*policiesv1beta1.MutatingPolicy)
+func (c *controller) deleteMP(obj policiesv1beta1.MutatingPolicyLike) {
+	mpol := kubeutils.GetObjectWithTombstone(obj).(policiesv1beta1.MutatingPolicyLike)
 
 	logger.V(2).Info("mutating policy deleted", "uid", mpol.GetUID(), "kind", mpol.GetKind(), "name", mpol.GetName())
 	c.enqueueMP(obj)
 }
 
-func (c *controller) enqueueMP(obj *policiesv1beta1.MutatingPolicy) {
+func (c *controller) enqueueMP(obj policiesv1beta1.MutatingPolicyLike) {
+	// Namespaced mutating policies are handled by the namespacedmutatingpolicy
+	// controller; the admissionpolicygenerator has no MAP generation work for
+	// namespaced scope. Detect them by scope instead of Kind because Kind may be
+	// unset on cached objects and in tests.
+	// Enqueueing a namespaced object with a "MutatingPolicy/" prefix would produce
+	// a 3-part key ("MutatingPolicy/namespace/name") that
+	// cache.SplitMetaNamespaceKey cannot parse, causing a permanent retry loop in
+	// the worker.
+	if obj.GetNamespace() != "" {
+		return
+	}
 	key, err := cache.MetaNamespaceKeyFunc(obj)
 	if err != nil {
 		logger.Error(err, "failed to extract policy name")

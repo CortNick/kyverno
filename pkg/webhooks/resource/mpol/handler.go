@@ -17,6 +17,7 @@ import (
 	engineapi "github.com/kyverno/kyverno/pkg/engine/api"
 	"github.com/kyverno/kyverno/pkg/engine/mutate/patch"
 	"github.com/kyverno/kyverno/pkg/event"
+	"github.com/kyverno/kyverno/pkg/toggle"
 	admissionutils "github.com/kyverno/kyverno/pkg/utils/admission"
 	jsonutils "github.com/kyverno/kyverno/pkg/utils/json"
 	reportutils "github.com/kyverno/kyverno/pkg/utils/report"
@@ -24,6 +25,7 @@ import (
 	webhookgenerate "github.com/kyverno/kyverno/pkg/webhooks/updaterequest"
 	webhookutils "github.com/kyverno/kyverno/pkg/webhooks/utils"
 	admissionv1 "k8s.io/api/admission/v1"
+	admissionregistrationv1 "k8s.io/api/admissionregistration/v1"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 )
 
@@ -59,7 +61,7 @@ func New(
 
 func (h *handler) MutateClustered(ctx context.Context, logger logr.Logger, admissionRequest handlers.AdmissionRequest, _ string, _ time.Time) handlers.AdmissionResponse {
 	policies := policyNamesFromContext(ctx)
-	return h.mutate(ctx, logger, admissionRequest, policies, mpolengine.And(mpolengine.MatchNames(policies...), mpolengine.ClusteredPolicy()))
+	return h.mutate(ctx, logger, admissionRequest, policies, mpolengine.And(mpolengine.MatchNames(policies...), mpolengine.ClusteredPolicy(), mpolengine.NoTargetMatchConstraintPolicy()))
 }
 
 func (h *handler) MutateNamespaced(ctx context.Context, logger logr.Logger, admissionRequest handlers.AdmissionRequest, _ string, _ time.Time) handlers.AdmissionResponse {
@@ -67,60 +69,90 @@ func (h *handler) MutateNamespaced(ctx context.Context, logger logr.Logger, admi
 		return admissionutils.ResponseSuccess(admissionRequest.UID)
 	}
 	policies := policyNamesFromContext(ctx)
-	return h.mutate(ctx, logger, admissionRequest, policies, mpolengine.And(mpolengine.MatchNames(policies...), mpolengine.NamespacedPolicy(admissionRequest.Namespace)))
+	return h.mutate(ctx, logger, admissionRequest, policies, mpolengine.And(mpolengine.MatchNames(policies...), mpolengine.NamespacedPolicy(admissionRequest.Namespace), mpolengine.NoTargetMatchConstraintPolicy()))
 }
 
 func (h *handler) mutate(ctx context.Context, logger logr.Logger, admissionRequest handlers.AdmissionRequest, policies []string, predicate mpolengine.Predicate) handlers.AdmissionResponse {
-	if h.backgroundServiceAccountName == admissionRequest.UserInfo.Username {
-		return admissionutils.ResponseSuccess(admissionRequest.UID)
+	isBackgroundRequest := h.backgroundServiceAccountName != "" && h.backgroundServiceAccountName == admissionRequest.UserInfo.Username
+	if isBackgroundRequest {
+		policies = h.filterBackgroundPolicies(logger, policies)
 	}
 	if len(policies) == 0 {
 		return admissionutils.ResponseSuccess(admissionRequest.UID)
 	}
 
 	request := celengine.RequestFromAdmission(h.context, admissionRequest.AdmissionRequest)
-	response, err := h.engine.Handle(ctx, request, predicate)
+	response, err := h.engine.Handle(ctx, request, mpolengine.And(mpolengine.MatchNames(policies...), predicate))
 	if err != nil {
 		logger.Error(err, "failed to handle mutating policy request")
-		return admissionutils.ResponseSuccess(admissionRequest.UID)
+		return admissionutils.Response(admissionRequest.UID, err)
 	}
 
 	go func() {
-		if err := h.audit(context.TODO(), response, request); err != nil {
+		if err := h.audit(context.WithoutCancel(ctx), response, request); err != nil {
 			logger.Error(err, "failed to create reports")
 		}
 	}()
 
-	go func() {
-		mpols := h.engine.MatchedMutateExistingPolicies(ctx, request)
-		for _, p := range mpols {
-			logger.V(4).Info("creating a UR for mpol", "name", p)
-			if err := h.urGenerator.Apply(ctx, kyvernov2.UpdateRequestSpec{
-				Type:   kyvernov2.CELMutate,
-				Policy: p,
-				Context: kyvernov2.UpdateRequestSpecContext{
-					UserRequestInfo: kyvernov2.RequestInfo{
-						Roles:             admissionRequest.Roles,
-						ClusterRoles:      admissionRequest.ClusterRoles,
-						AdmissionUserInfo: *admissionRequest.UserInfo.DeepCopy(),
-					},
-					AdmissionRequestInfo: kyvernov2.AdmissionRequestInfoObject{
-						AdmissionRequest: &admissionRequest.AdmissionRequest,
-						Operation:        admissionRequest.Operation,
-					},
-				},
-			}); err != nil {
-				logger.Error(err, "failed to create update request for mutate existing policy", "policy", p)
+	// Skip mutate-existing UpdateRequest creation for dry-run requests
+	// to honor the SideEffects: NoneOnDryRun contract.
+	if !admissionutils.IsDryRun(admissionRequest.AdmissionRequest) {
+		go func() {
+			ctx := context.WithoutCancel(ctx)
+			// MatchedMutateExistingPolicies only returns admission-enabled policies:
+			// admission-disabled policies opt out of the admission plane entirely and
+			// are driven by policy events and the periodic background scan instead.
+			mpols := h.engine.MatchedMutateExistingPolicies(ctx, request)
+			if isBackgroundRequest {
+				mpols = h.filterBackgroundPolicies(logger, mpols)
 			}
-		}
-	}()
+			for _, p := range mpols {
+				logger.V(4).Info("creating a UR for mpol", "name", p)
+				if err := h.urGenerator.Apply(ctx, kyvernov2.UpdateRequestSpec{
+					Type:   kyvernov2.CELMutate,
+					Policy: p,
+					Context: kyvernov2.UpdateRequestSpecContext{
+						UserRequestInfo: kyvernov2.RequestInfo{
+							Roles:             admissionRequest.Roles,
+							ClusterRoles:      admissionRequest.ClusterRoles,
+							AdmissionUserInfo: *admissionRequest.UserInfo.DeepCopy(),
+						},
+						AdmissionRequestInfo: kyvernov2.AdmissionRequestInfoObject{
+							AdmissionRequest: &admissionRequest.AdmissionRequest,
+							Operation:        admissionRequest.Operation,
+						},
+					},
+				}); err != nil {
+					logger.Error(err, "failed to create update request for mutate existing policy", "policy", p)
+				}
+			}
+		}()
+	}
 
 	resp, err := h.admissionResponse(request, response)
 	if err != nil {
 		logger.Error(err, "mutation failures")
-		return admissionutils.ResponseSuccess(admissionRequest.UID)
+		return admissionutils.Response(admissionRequest.UID, err)
 	}
 	return resp
+}
+
+func (h *handler) filterBackgroundPolicies(logger logr.Logger, policies []string) []string {
+	compiledPolicies := h.engine.GetCompiledPolicies(policies...)
+	filtered := make([]string, 0, len(policies))
+	for _, name := range policies {
+		policy, ok := compiledPolicies[name]
+		if !ok {
+			logger.V(4).Info("skipping background request for policy because compiled policy is unavailable", "policy", name)
+			continue
+		}
+		if policy.Policy.GetSpec().SkipBackgroundRequestsEnabled() {
+			logger.V(4).Info("skipping background request for policy", "policy", name)
+			continue
+		}
+		filtered = append(filtered, name)
+	}
+	return filtered
 }
 
 func (h *handler) audit(ctx context.Context, response mpolengine.EngineResponse, request celengine.EngineRequest) error {
@@ -188,10 +220,15 @@ func (h *handler) admissionResponse(request celengine.EngineRequest, response mp
 	var mutationErrors []string
 
 	for _, policy := range response.Policies {
+		failurePolicy := policy.Policy.GetFailurePolicy(toggle.FromContext(context.TODO()).ForceFailurePolicyIgnore())
 		for _, rule := range policy.Rules {
 			switch rule.Status() {
 			case engineapi.RuleStatusError:
-				mutationErrors = append(mutationErrors, fmt.Sprintf("Policy %s: %s", policy.Policy.GetName(), rule.Message()))
+				// Only block the request if failurePolicy is Fail
+				// If failurePolicy is Ignore, the error is logged but the request proceeds
+				if failurePolicy == admissionregistrationv1.Fail {
+					mutationErrors = append(mutationErrors, fmt.Sprintf("Policy %s: %s", policy.Policy.GetName(), rule.Message()))
+				}
 			case engineapi.RuleStatusWarn:
 				warnings = append(warnings, rule.Message())
 			}
@@ -199,9 +236,9 @@ func (h *handler) admissionResponse(request celengine.EngineRequest, response mp
 	}
 
 	if len(mutationErrors) > 0 {
-		return admissionutils.ResponseSuccess(request.Request.UID),
-			fmt.Errorf("Resource: %s/%s, Kind: %s, Errors: %v\n",
-				request.Request.Namespace, request.Request.Name, request.Request.Kind.Kind, mutationErrors)
+		err := fmt.Errorf("Resource: %s/%s, Kind: %s, Errors: %v",
+			request.Request.Namespace, request.Request.Name, request.Request.Kind.Kind, mutationErrors)
+		return admissionutils.Response(request.Request.UID, err), err
 	}
 
 	if response.PatchedResource != nil {

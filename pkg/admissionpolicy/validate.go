@@ -159,10 +159,7 @@ func Validate(
 			},
 		}
 	}
-	var user UserInfo
-	if userInfo != nil {
-		user = NewUser(*userInfo)
-	}
+	user := ResolveUser(userInfo)
 	a := admission.NewAttributesRecord(resource.DeepCopyObject(), nil, gvk, resource.GetNamespace(), resource.GetName(), gvr, "", admission.Create, nil, false, user)
 
 	if len(bindings) == 0 {
@@ -189,7 +186,7 @@ func processVAPNoBindings(policy *admissionregistrationv1.ValidatingAdmissionPol
 		return er, nil
 	}
 
-	vapLogger.V(3).Info("apply mutatingadmissionpolicy %s to resource %s", policy.GetName(), resPath)
+	vapLogger.V(3).Info("applying validatingadmissionpolicy to resource", "policy", policy.GetName(), "resource", resPath)
 	er, err = validateResource(policy, nil, resource, nil, namespace, a)
 	if err != nil {
 		vapLogger.Error(err, "failed to validate resource with validatingadmissionpolicy", "policy", policy.GetName(), "resource", resPath)
@@ -384,6 +381,7 @@ func validateResource(
 		compiler.CompileAuditAnnotationsExpressions(optionalVars),
 		compiler.CompileMessageExpressions(optionalVars),
 		policy.Spec.FailurePolicy,
+		nil,
 	)
 	versionedAttr, _ := admission.NewVersionedAttributes(a, a.GetKind(), nil)
 	validateResult := validator.Validate(context.TODO(), a.GetResource(), versionedAttr, parameterResource, namespace, celconfig.RuntimeCELCostBudget, nil)

@@ -20,6 +20,7 @@ import (
 	"k8s.io/client-go/kubernetes"
 	eventsv1 "k8s.io/client-go/kubernetes/typed/events/v1"
 	"k8s.io/client-go/rest"
+	"k8s.io/client-go/restmapper"
 )
 
 type Interface interface {
@@ -79,9 +80,11 @@ func NewClient(
 		kube: kube,
 		rest: disco.RESTClient(),
 	}
+	cachedClient := memory.NewMemCacheClient(disco)
 	// Set discovery client
 	discoveryClient := &serverResources{
-		cachedClient: memory.NewMemCacheClient(disco),
+		cachedClient: cachedClient,
+		mapper:       restmapper.NewDeferredDiscoveryRESTMapper(cachedClient),
 	}
 	// client will invalidate registered resources cache every x seconds,
 	// As there is no way to identify if the registered resource is available or not
@@ -223,7 +226,7 @@ func (c *client) rawAbsPathForFakeClient(ctx context.Context, path string, metho
 		}
 	}
 
-	if resource == "" || name == "" {
+	if resource == "" {
 		return nil, fmt.Errorf("failed to parse path: %s", path)
 	}
 
@@ -233,32 +236,41 @@ func (c *client) rawAbsPathForFakeClient(ctx context.Context, path string, metho
 		Resource: resource,
 	}
 
+	var kind string
+	resolvedAPIVersion := version
+	if group != "" {
+		resolvedAPIVersion = group + "/" + version
+	}
+
 	gvk, err := c.disco.GetGVKFromGVR(gvr)
 	if err != nil {
-		kind := inferKindFromResourceName(resource)
-		apiVersion := version
-		if group != "" {
-			apiVersion = group + "/" + version
+		kind = inferKindFromResourceName(resource)
+	} else {
+		kind = gvk.Kind
+		resolvedAPIVersion = gvk.GroupVersion().String()
+		if gvk.Group == "" {
+			resolvedAPIVersion = gvk.Version
 		}
-		obj, err := c.GetResource(ctx, apiVersion, kind, namespace, name)
+	}
+
+	if name == "" {
+		list, err := c.ListResource(ctx, resolvedAPIVersion, kind, namespace, nil)
 		if err != nil {
-			return nil, fmt.Errorf("failed to get resource %s/%s/%s: %w", apiVersion, kind, name, err)
+			if namespace == "" {
+				return nil, fmt.Errorf("failed to list resources %s/%s (cluster-scoped or all namespaces): %w", resolvedAPIVersion, kind, err)
+			}
+			return nil, fmt.Errorf("failed to list resources %s/%s in namespace %q: %w", resolvedAPIVersion, kind, namespace, err)
 		}
-		jsonData, err := json.Marshal(obj)
+		jsonData, err := json.Marshal(list)
 		if err != nil {
-			return nil, fmt.Errorf("failed to marshal resource to JSON: %w", err)
+			return nil, fmt.Errorf("failed to marshal resource list to JSON: %w", err)
 		}
 		return jsonData, nil
 	}
 
-	apiVersion := gvk.GroupVersion().String()
-	if gvk.Group == "" {
-		apiVersion = gvk.Version
-	}
-
-	obj, err := c.GetResource(ctx, apiVersion, gvk.Kind, namespace, name)
+	obj, err := c.GetResource(ctx, resolvedAPIVersion, kind, namespace, name)
 	if err != nil {
-		return nil, fmt.Errorf("failed to get resource %s/%s/%s: %w", apiVersion, gvk.Kind, name, err)
+		return nil, fmt.Errorf("failed to get resource %s/%s/%s: %w", resolvedAPIVersion, kind, name, err)
 	}
 
 	jsonData, err := json.Marshal(obj)

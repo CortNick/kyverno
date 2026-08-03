@@ -17,18 +17,22 @@ import (
 	"github.com/kyverno/kyverno/pkg/engine/adapters"
 	engineapi "github.com/kyverno/kyverno/pkg/engine/api"
 	"github.com/kyverno/kyverno/pkg/engine/jmespath"
-	"github.com/kyverno/kyverno/pkg/imageverifycache"
+	imageverifycache "github.com/kyverno/kyverno/pkg/image/verification/cache"
 	kubeutils "github.com/kyverno/kyverno/pkg/utils/kube"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/util/sets"
 )
 
+func PolicyRuleKey(policy kyvernov1.PolicyInterface, ruleName string) string {
+	return fmt.Sprintf("%s/%s/%s/%s", policy.GetKind(), policy.GetNamespace(), policy.GetName(), ruleName)
+}
+
 func handleGeneratePolicy(out io.Writer, store *store.Store, generateResponse *engineapi.EngineResponse, policyContext engine.PolicyContext, ruleToCloneSourceResource map[string]string) ([]engineapi.RuleResponse, error) {
 	newResource := policyContext.NewResource()
 	objects := []runtime.Object{&newResource}
 	for _, rule := range generateResponse.PolicyResponse.Rules {
-		if path, ok := ruleToCloneSourceResource[rule.Name()]; ok {
+		if path, ok := ruleToCloneSourceResource[PolicyRuleKey(policyContext.Policy(), rule.Name())]; ok {
 			resourceBytes, err := resource.GetFileBytes(path)
 			if err != nil {
 				fmt.Fprintf(out, "failed to get resource bytes\n")

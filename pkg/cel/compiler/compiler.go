@@ -78,6 +78,26 @@ func CompileVariables(path *field.Path, env *cel.Env, VariablesProvider *Variabl
 	return result, allErrs
 }
 
+func CompileMutation(path *field.Path, env *cel.Env, expression string, returnType *types.Type) (cel.Program, field.ErrorList) {
+	var allErrs field.ErrorList
+	{
+		path := path.Child("expression")
+		ast, issues := env.Compile(expression)
+		if err := issues.Err(); err != nil {
+			return nil, append(allErrs, field.Invalid(path, expression, err.Error()))
+		}
+		if !ast.OutputType().IsExactType(returnType) {
+			msg := fmt.Sprintf("output is expected to be of type %s", returnType.TypeName())
+			return nil, append(allErrs, field.Invalid(path, expression, msg))
+		}
+		prog, err := env.Program(ast)
+		if err != nil {
+			return nil, append(allErrs, field.Invalid(path, expression, err.Error()))
+		}
+		return prog, allErrs
+	}
+}
+
 func CompileAuditAnnotation(path *field.Path, env *cel.Env, auditAnnotation admissionregistrationv1.AuditAnnotation) (cel.Program, field.ErrorList) {
 	var allErrs field.ErrorList
 	{
@@ -195,7 +215,8 @@ func CompileMatchImageReferences(path *field.Path, env *cel.Env, matches ...v1be
 	return result, allErrs
 }
 
-func compileGeneration(path *field.Path, env *cel.Env, generation policiesv1beta1.Generation) (cel.Program, field.ErrorList) {
+// CompileGeneration compiles the CEL expression of a generation entry.
+func CompileGeneration(path *field.Path, env *cel.Env, generation policiesv1beta1.Generation) (cel.Program, field.ErrorList) {
 	var allErrs field.ErrorList
 	{
 		path := path.Child("expression")
@@ -221,7 +242,7 @@ func CompileGenerations(path *field.Path, env *cel.Env, generations ...policiesv
 	}
 	result = make([]cel.Program, 0, len(generations))
 	for i, generation := range generations {
-		prog, errs := compileGeneration(path.Index(i), env, generation)
+		prog, errs := CompileGeneration(path.Index(i), env, generation)
 		allErrs = append(allErrs, errs...)
 		if prog != nil {
 			result = append(result, prog)

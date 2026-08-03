@@ -4,8 +4,11 @@ import (
 	"encoding/json"
 	"testing"
 
+	policiesv1alpha1 "github.com/kyverno/api/api/policies.kyverno.io/v1alpha1"
+	policiesv1beta1 "github.com/kyverno/api/api/policies.kyverno.io/v1beta1"
 	kyvernov1 "github.com/kyverno/kyverno/api/kyverno/v1"
 	autogenv1 "github.com/kyverno/kyverno/pkg/autogen/v1"
+	engineapi "github.com/kyverno/kyverno/pkg/engine/api"
 	"github.com/stretchr/testify/assert"
 	admissionregistrationv1 "k8s.io/api/admissionregistration/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -770,6 +773,240 @@ func TestDeduplicateRules(t *testing.T) {
 			result := deDuplicatedRules(tc.input)
 			assert.Equal(t, tc.expectedCount, len(result))
 			assert.Equal(t, tc.expectedRules, result)
+		})
+	}
+}
+
+func TestSortedRules(t *testing.T) {
+	rule_apps_pods := admissionregistrationv1.RuleWithOperations{
+		Rule: admissionregistrationv1.Rule{
+			APIGroups:   []string{"apps"},
+			APIVersions: []string{"v1"},
+			Resources:   []string{"pods"},
+			Scope:       ptr.To(admissionregistrationv1.NamespacedScope),
+		},
+		Operations: []admissionregistrationv1.OperationType{
+			admissionregistrationv1.Create,
+			admissionregistrationv1.Update,
+		},
+	}
+	rule_apps_pods_cluster := admissionregistrationv1.RuleWithOperations{
+		Rule: admissionregistrationv1.Rule{
+			APIGroups:   []string{"apps"},
+			APIVersions: []string{"v1"},
+			Resources:   []string{"pods"},
+			Scope:       ptr.To(admissionregistrationv1.ClusterScope),
+		},
+		Operations: []admissionregistrationv1.OperationType{
+			admissionregistrationv1.Create,
+			admissionregistrationv1.Update,
+		},
+	}
+	rule_apps_pods_all := admissionregistrationv1.RuleWithOperations{
+		Rule: admissionregistrationv1.Rule{
+			APIGroups:   []string{"apps"},
+			APIVersions: []string{"v1"},
+			Resources:   []string{"pods"},
+			Scope:       ptr.To(admissionregistrationv1.AllScopes),
+		},
+		Operations: []admissionregistrationv1.OperationType{
+			admissionregistrationv1.OperationAll,
+		},
+	}
+	rule_batch_jobs := admissionregistrationv1.RuleWithOperations{
+		Rule: admissionregistrationv1.Rule{
+			APIGroups:   []string{"batch"},
+			APIVersions: []string{"v1"},
+			Resources:   []string{"jobs"},
+			Scope:       ptr.To(admissionregistrationv1.NamespacedScope),
+		},
+		Operations: []admissionregistrationv1.OperationType{
+			admissionregistrationv1.Create,
+			admissionregistrationv1.Delete,
+		},
+	}
+	rule_batch_cronjobs := admissionregistrationv1.RuleWithOperations{
+		Rule: admissionregistrationv1.Rule{
+			APIGroups:   []string{"batch"},
+			APIVersions: []string{"v1"},
+			Resources:   []string{"cronjobs"},
+			Scope:       ptr.To(admissionregistrationv1.NamespacedScope),
+		},
+		Operations: []admissionregistrationv1.OperationType{
+			admissionregistrationv1.Create,
+			admissionregistrationv1.Delete,
+		},
+	}
+	rule_v1beta1_apps := admissionregistrationv1.RuleWithOperations{
+		Rule: admissionregistrationv1.Rule{
+			APIGroups:   []string{"apps"},
+			APIVersions: []string{"v1beta1"},
+			Resources:   []string{"deployments", "pods"},
+			Scope:       ptr.To(admissionregistrationv1.NamespacedScope),
+		},
+		Operations: []admissionregistrationv1.OperationType{
+			admissionregistrationv1.Create,
+			admissionregistrationv1.Update,
+		},
+	}
+
+	testCases := []struct {
+		name          string
+		input         []admissionregistrationv1.RuleWithOperations
+		expectedCount int
+		expectedRules []admissionregistrationv1.RuleWithOperations
+	}{
+		{
+			name:          "Sorted by API group",
+			input:         []admissionregistrationv1.RuleWithOperations{rule_batch_jobs, rule_apps_pods},
+			expectedRules: []admissionregistrationv1.RuleWithOperations{rule_apps_pods, rule_batch_jobs},
+		},
+		{
+			name:          "Sorted by API version",
+			input:         []admissionregistrationv1.RuleWithOperations{rule_v1beta1_apps, rule_apps_pods},
+			expectedRules: []admissionregistrationv1.RuleWithOperations{rule_apps_pods, rule_v1beta1_apps},
+		},
+		{
+			name:          "Sorted by resource",
+			input:         []admissionregistrationv1.RuleWithOperations{rule_batch_jobs, rule_batch_cronjobs},
+			expectedRules: []admissionregistrationv1.RuleWithOperations{rule_batch_cronjobs, rule_batch_jobs},
+		},
+		{
+			name:          "Sorted by operation",
+			input:         []admissionregistrationv1.RuleWithOperations{rule_apps_pods, rule_apps_pods_all},
+			expectedRules: []admissionregistrationv1.RuleWithOperations{rule_apps_pods_all, rule_apps_pods},
+		},
+		{
+			name:          "Sorted by scope",
+			input:         []admissionregistrationv1.RuleWithOperations{rule_apps_pods, rule_apps_pods_cluster},
+			expectedRules: []admissionregistrationv1.RuleWithOperations{rule_apps_pods_cluster, rule_apps_pods},
+		},
+	}
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			result := sortedRules(tc.input)
+			assert.Equal(t, tc.expectedRules, result)
+		})
+	}
+}
+
+func TestIvpolsNeedingMutation(t *testing.T) {
+	trueVal := true
+	falseVal := false
+
+	tests := []struct {
+		name          string
+		ivpols        []engineapi.GenericPolicy
+		expectedCount int
+	}{
+		{
+			name:          "empty input",
+			ivpols:        []engineapi.GenericPolicy{},
+			expectedCount: 0,
+		},
+		{
+			name: "nil MutateDigest and nil VerifyDigest default to true -- needs mutation",
+			ivpols: []engineapi.GenericPolicy{
+				engineapi.NewImageValidatingPolicy(&policiesv1beta1.ImageValidatingPolicy{
+					Spec: policiesv1beta1.ImageValidatingPolicySpec{
+						ValidationConfigurations: policiesv1alpha1.ValidationConfiguration{
+							MutateDigest: nil,
+							VerifyDigest: nil,
+						},
+					},
+				}),
+			},
+			expectedCount: 1,
+		},
+		{
+			name: "MutateDigest true -- needs mutation",
+			ivpols: []engineapi.GenericPolicy{
+				engineapi.NewImageValidatingPolicy(&policiesv1beta1.ImageValidatingPolicy{
+					Spec: policiesv1beta1.ImageValidatingPolicySpec{
+						ValidationConfigurations: policiesv1alpha1.ValidationConfiguration{
+							MutateDigest: &trueVal,
+							VerifyDigest: &falseVal,
+						},
+					},
+				}),
+			},
+			expectedCount: 1,
+		},
+		{
+			// VerifyDigest is a validation concern (the validating webhook asserts the
+			// image carries a digest); it never requires a mutating webhook, which can
+			// only ever pin digests.
+			name: "VerifyDigest true but MutateDigest false -- does not need mutation",
+			ivpols: []engineapi.GenericPolicy{
+				engineapi.NewImageValidatingPolicy(&policiesv1beta1.ImageValidatingPolicy{
+					Spec: policiesv1beta1.ImageValidatingPolicySpec{
+						ValidationConfigurations: policiesv1alpha1.ValidationConfiguration{
+							MutateDigest: &falseVal,
+							VerifyDigest: &trueVal,
+						},
+					},
+				}),
+			},
+			expectedCount: 0,
+		},
+		{
+			name: "nil MutateDigest defaults to true even when VerifyDigest is false -- needs mutation",
+			ivpols: []engineapi.GenericPolicy{
+				engineapi.NewImageValidatingPolicy(&policiesv1beta1.ImageValidatingPolicy{
+					Spec: policiesv1beta1.ImageValidatingPolicySpec{
+						ValidationConfigurations: policiesv1alpha1.ValidationConfiguration{
+							MutateDigest: nil,
+							VerifyDigest: &falseVal,
+						},
+					},
+				}),
+			},
+			expectedCount: 1,
+		},
+		{
+			// Core regression: test C from the issue -- both false means no mutating
+			// webhook should be registered.
+			name: "both false -- does not need mutation",
+			ivpols: []engineapi.GenericPolicy{
+				engineapi.NewImageValidatingPolicy(&policiesv1beta1.ImageValidatingPolicy{
+					Spec: policiesv1beta1.ImageValidatingPolicySpec{
+						ValidationConfigurations: policiesv1alpha1.ValidationConfiguration{
+							MutateDigest: &falseVal,
+							VerifyDigest: &falseVal,
+						},
+					},
+				}),
+			},
+			expectedCount: 0,
+		},
+		{
+			name: "mixed -- only policies needing mutation are kept",
+			ivpols: []engineapi.GenericPolicy{
+				engineapi.NewImageValidatingPolicy(&policiesv1beta1.ImageValidatingPolicy{
+					Spec: policiesv1beta1.ImageValidatingPolicySpec{
+						ValidationConfigurations: policiesv1alpha1.ValidationConfiguration{
+							MutateDigest: &trueVal,
+							VerifyDigest: &falseVal,
+						},
+					},
+				}),
+				engineapi.NewImageValidatingPolicy(&policiesv1beta1.ImageValidatingPolicy{
+					Spec: policiesv1beta1.ImageValidatingPolicySpec{
+						ValidationConfigurations: policiesv1alpha1.ValidationConfiguration{
+							MutateDigest: &falseVal,
+							VerifyDigest: &falseVal,
+						},
+					},
+				}),
+			},
+			expectedCount: 1,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := ivpolsNeedingMutation(tt.ivpols)
+			assert.Equal(t, tt.expectedCount, len(got))
 		})
 	}
 }

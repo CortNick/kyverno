@@ -51,8 +51,32 @@ func (c *cache) GetPolicies(pkey PolicyType, gvr schema.GroupVersionResource, su
 		result = append(result, c.store.get(pkey, gvr, subresource, namespace.Name)...)
 	}
 	// also get policies with ValidateEnforce
+	// This is needed because a policy may be stored under ValidateEnforce (because it has at least one enforce rule),
+	// but still contain audit rules (due to per-rule validationFailureAction or validationFailureActionOverrides).
+	// We must fetch both cluster-wide and namespace-scoped enforce policies to ensure audit rules are not missed.
 	if pkey == ValidateAudit {
 		result = append(result, c.store.get(ValidateEnforce, gvr, subresource, "")...)
+		if namespace != nil {
+			result = append(result, c.store.get(ValidateEnforce, gvr, subresource, namespace.Name)...)
+		}
+	}
+	// also surface the audit rules of enforce policies that emit warnings.
+	// A policy with at least one enforce rule is stored under ValidateEnforce and never under
+	// ValidateAuditWarn, so the audit rules of a mixed audit+enforce policy would never emit a warning.
+	// Pull those enforce policies, keep only the ones that opt into warnings, and reduce each to its
+	// audit rules for the namespace.
+	if pkey == ValidateAuditWarn {
+		enforce := c.store.get(ValidateEnforce, gvr, subresource, "")
+		if namespace != nil {
+			enforce = append(enforce, c.store.get(ValidateEnforce, gvr, subresource, namespace.Name)...)
+		}
+		for _, policy := range enforce {
+			if emitWarning := policy.GetSpec().EmitWarning; emitWarning != nil && *emitWarning {
+				if keep, filtered := checkValidationFailureActionOverrides(false, namespace, policy); keep {
+					result = append(result, filtered)
+				}
+			}
+		}
 	}
 	if pkey == ValidateAudit || pkey == ValidateEnforce {
 		result = filterPolicies(pkey, result, namespace)
@@ -106,6 +130,14 @@ func checkValidationFailureActionOverrides(enforce bool, namespace *corev1.Names
 		// Track if an override matched for the namespace
 		overrideMatched := false
 		for _, action := range validationFailureActionOverrides {
+			// Global override: both Namespaces and NamespaceSelector are empty/nil - applies to all namespaces
+			if len(action.Namespaces) == 0 && action.NamespaceSelector == nil {
+				overrideMatched = true
+				if action.Action.Enforce() == enforce {
+					filteredRules = append(filteredRules, *rule)
+				}
+				break // Stop once we find a matching override
+			}
 			if namespace != nil && wildcard.CheckPatterns(action.Namespaces, namespace.Name) {
 				overrideMatched = true
 				if action.Action.Enforce() == enforce {

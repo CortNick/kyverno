@@ -11,10 +11,23 @@ func MatchNames(names ...string) Predicate {
 	}
 	if len(names) == 1 {
 		name := names[0]
-		return func(policy policiesv1beta1.MutatingPolicyLike) bool { return policy.GetName() == name }
+		return func(policy policiesv1beta1.MutatingPolicyLike) bool {
+			return policy.GetName() == name || PolicyKey(policy) == name
+		}
 	}
 	namesSet := sets.New(names...)
-	return func(policy policiesv1beta1.MutatingPolicyLike) bool { return namesSet.Has(policy.GetName()) }
+	return func(policy policiesv1beta1.MutatingPolicyLike) bool {
+		return namesSet.Has(policy.GetName()) || namesSet.Has(PolicyKey(policy))
+	}
+}
+
+// PolicyKey returns the stable identifier of a policy: namespace/name for
+// namespaced policies and the bare name for clustered policies.
+func PolicyKey(policy policiesv1beta1.MutatingPolicyLike) string {
+	if policy.GetNamespace() == "" {
+		return policy.GetName()
+	}
+	return policy.GetNamespace() + "/" + policy.GetName()
 }
 
 func ClusteredPolicy() Predicate {
@@ -23,6 +36,22 @@ func ClusteredPolicy() Predicate {
 
 func NamespacedPolicy(namespace string) Predicate {
 	return func(policy policiesv1beta1.MutatingPolicyLike) bool { return policy.GetNamespace() == namespace }
+}
+
+func NoTargetMatchConstraintPolicy() Predicate {
+	return func(policy policiesv1beta1.MutatingPolicyLike) bool {
+		tmc := policy.GetSpec().TargetMatchConstraints
+
+		if tmc == nil {
+			return true
+		}
+
+		if len(tmc.ResourceRules) == 0 && tmc.Expression == "" {
+			return true
+		}
+
+		return false
+	}
 }
 
 func And(conditions ...Predicate) Predicate {

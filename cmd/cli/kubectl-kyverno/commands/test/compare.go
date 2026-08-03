@@ -7,21 +7,21 @@ import (
 	"github.com/kyverno/kyverno/cmd/cli/kubectl-kyverno/log"
 	"github.com/kyverno/kyverno/cmd/cli/kubectl-kyverno/resource"
 	"github.com/sergi/go-diff/diffmatchpatch"
-	"gopkg.in/yaml.v2"
+	"go.yaml.in/yaml/v3"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 )
 
-func getAndCompareResource(actualResource unstructured.Unstructured, fs billy.Filesystem, path string) (bool, string, error) {
+func getAndCompareResource(actualResource unstructured.Unstructured, fs billy.Filesystem, path string, resourceType string) (bool, string, error) {
 	expectedResource, err := resource.GetResourceFromPath(fs, path, actualResource.GetAPIVersion(), actualResource.GetKind(), actualResource.GetNamespace(), actualResource.GetName())
 	if err != nil {
-		return false, "", fmt.Errorf("error: failed to load resource (%s)", err)
+		return false, "", fmt.Errorf("error: failed to load %s resource (%s)", resourceType, err)
 	}
 	resource.FixupGenerateLabels(actualResource)
 	resource.FixupGenerateLabels(*expectedResource)
 
 	equals, err := resource.Compare(actualResource, *expectedResource, true)
 	if err != nil {
-		return false, "", fmt.Errorf("error: failed to compare resources (%s)", err)
+		return false, "", fmt.Errorf("error: failed to compare %s resources (%s)", resourceType, err)
 	}
 	if !equals {
 		log.Log.V(4).Info("Resource diff", "expected", expectedResource, "actual", actualResource)

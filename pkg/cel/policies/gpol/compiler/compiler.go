@@ -9,25 +9,26 @@ import (
 	"github.com/google/cel-go/ext"
 	policiesv1beta1 "github.com/kyverno/api/api/policies.kyverno.io/v1beta1"
 	"github.com/kyverno/kyverno/pkg/cel/compiler"
-	cellibs "github.com/kyverno/kyverno/pkg/cel/libs"
-	"github.com/kyverno/kyverno/pkg/cel/libs/generator"
-	"github.com/kyverno/kyverno/pkg/cel/libs/globalcontext"
-	"github.com/kyverno/kyverno/pkg/cel/libs/hash"
-	"github.com/kyverno/kyverno/pkg/cel/libs/http"
-	"github.com/kyverno/kyverno/pkg/cel/libs/image"
-	"github.com/kyverno/kyverno/pkg/cel/libs/imagedata"
-	"github.com/kyverno/kyverno/pkg/cel/libs/json"
-	"github.com/kyverno/kyverno/pkg/cel/libs/math"
-	"github.com/kyverno/kyverno/pkg/cel/libs/random"
-	"github.com/kyverno/kyverno/pkg/cel/libs/resource"
-	"github.com/kyverno/kyverno/pkg/cel/libs/time"
-	"github.com/kyverno/kyverno/pkg/cel/libs/transform"
-	"github.com/kyverno/kyverno/pkg/cel/libs/x509"
-	"github.com/kyverno/kyverno/pkg/cel/libs/yaml"
+	"github.com/kyverno/kyverno/pkg/cel/libs"
+	"github.com/kyverno/kyverno/pkg/cel/policies/gpol/template"
+	"github.com/kyverno/sdk/extensions/cel/libs/generator"
+	"github.com/kyverno/sdk/extensions/cel/libs/globalcontext"
+	"github.com/kyverno/sdk/extensions/cel/libs/gzip"
+	"github.com/kyverno/sdk/extensions/cel/libs/hash"
+	"github.com/kyverno/sdk/extensions/cel/libs/http"
+	"github.com/kyverno/sdk/extensions/cel/libs/image"
+	"github.com/kyverno/sdk/extensions/cel/libs/imagedata"
+	"github.com/kyverno/sdk/extensions/cel/libs/json"
+	"github.com/kyverno/sdk/extensions/cel/libs/math"
+	"github.com/kyverno/sdk/extensions/cel/libs/random"
+	"github.com/kyverno/sdk/extensions/cel/libs/resource"
+	"github.com/kyverno/sdk/extensions/cel/libs/time"
+	"github.com/kyverno/sdk/extensions/cel/libs/transform"
+	"github.com/kyverno/sdk/extensions/cel/libs/x509"
+	"github.com/kyverno/sdk/extensions/cel/libs/yaml"
 	"k8s.io/apimachinery/pkg/util/validation/field"
 	"k8s.io/apimachinery/pkg/util/version"
 	apiservercel "k8s.io/apiserver/pkg/cel"
-	"k8s.io/apiserver/pkg/cel/environment"
 )
 
 var (
@@ -45,8 +46,14 @@ func NewCompiler() Compiler {
 
 type compilerImpl struct{}
 
-func createBaseGpolEnv(namespace string) (*environment.EnvSet, *compiler.VariablesProvider, error) {
-	baseOpts := compiler.DefaultEnvOptions()
+func (c *compilerImpl) createBaseGpolEnv(libsctx libs.Context, namespace string) (*cel.Env, *compiler.VariablesProvider, error) {
+	baseOpts := compiler.EnvOptionsForVersion(
+		gpolCompilerVersion,
+		compiler.VersionedEnvOptions{
+			IntroducedVersion: version.MajorMinor(1, 0),
+			EnvOptions:        compiler.DynamicResourceEnvOptionsWithCompat(),
+		},
+	)
 	baseOpts = append(baseOpts,
 		cel.Variable(compiler.NamespaceObjectKey, compiler.NamespaceType.CelType()),
 		cel.Variable(compiler.ObjectKey, cel.DynType),
@@ -54,21 +61,15 @@ func createBaseGpolEnv(namespace string) (*environment.EnvSet, *compiler.Variabl
 		cel.Variable(compiler.RequestKey, compiler.RequestType.CelType()),
 		cel.Types(compiler.NamespaceType.CelType()),
 		cel.Types(compiler.RequestType.CelType()),
-		cel.Variable(compiler.GeneratorKey, generator.ContextType),
-		cel.Variable(compiler.ResourceKey, resource.ContextType),
-		cel.Variable(compiler.GlobalContextKey, globalcontext.ContextType),
-		cel.Variable(compiler.HttpKey, http.ContextType),
 		cel.Variable(compiler.VariablesKey, compiler.VariablesType),
-		cel.Variable(compiler.ImageDataKey, imagedata.ContextType),
 	)
 
-	base := environment.MustBaseEnvSet(gpolCompilerVersion)
-	env, err := base.Env(environment.StoredExpressions)
+	baseEnv, err := cel.NewEnv(baseOpts...)
 	if err != nil {
 		return nil, nil, err
 	}
 
-	variablesProvider := compiler.NewVariablesProvider(env.CELTypeProvider())
+	variablesProvider := compiler.NewVariablesProvider(baseEnv.CELTypeProvider())
 	declProvider := apiservercel.NewDeclTypeProvider(compiler.NamespaceType, compiler.RequestType)
 	declOptions, err := declProvider.EnvOptions(variablesProvider)
 	if err != nil {
@@ -77,29 +78,24 @@ func createBaseGpolEnv(namespace string) (*environment.EnvSet, *compiler.Variabl
 
 	baseOpts = append(baseOpts, declOptions...)
 
-	// the custom types have to be registered after the decl options have been registered, because these are what allow
-	// go struct type resolution
-	extendedBase, err := base.Extend(
-		environment.VersionedOptions{
-			IntroducedVersion: gpolCompilerVersion,
-			EnvOptions:        baseOpts,
-		},
-		// libaries
-		environment.VersionedOptions{
-			IntroducedVersion: gpolCompilerVersion,
+	libEnvOpts := compiler.EnvOptionsForVersion(
+		gpolCompilerVersion,
+		compiler.VersionedEnvOptions{
+			IntroducedVersion: version.MajorMinor(1, 0),
 			EnvOptions: []cel.EnvOption{
-				ext.NativeTypes(reflect.TypeFor[cellibs.Exception](), ext.ParseStructTags(true)),
+				ext.NativeTypes(reflect.TypeFor[libs.Exception](), ext.ParseStructTags(true)),
 				cel.Variable(compiler.ExceptionsKey, types.NewObjectType("libs.Exception")),
 				generator.Lib(
+					generator.Context{ContextInterface: libsctx},
+					namespace,
 					generator.Latest(),
 				),
 				globalcontext.Lib(
+					globalcontext.Context{ContextInterface: libsctx},
 					globalcontext.Latest(),
 				),
-				http.Lib(
-					http.Latest(),
-				),
 				resource.Lib(
+					resource.Context{ContextInterface: libsctx},
 					namespace,
 					resource.Latest(),
 				),
@@ -107,7 +103,9 @@ func createBaseGpolEnv(namespace string) (*environment.EnvSet, *compiler.Variabl
 					image.Latest(),
 				),
 				imagedata.Lib(
+					imagedata.Context{ContextInterface: libsctx},
 					imagedata.Latest(),
+					nil,
 				),
 				hash.Lib(
 					hash.Latest(),
@@ -135,9 +133,20 @@ func createBaseGpolEnv(namespace string) (*environment.EnvSet, *compiler.Variabl
 				transform.Lib(
 					transform.Latest(),
 				),
+				gzip.Lib(
+					gzip.Latest(),
+				),
+				http.Lib(
+					http.Context{ContextInterface: libs.NewMockAwareHTTPContext(compiler.NewLazyCELHTTPContext(namespace), libsctx.GetHTTPMocks())},
+					http.Latest(),
+				),
 			},
 		},
 	)
+	// the custom types have to be registered after the decl options have been registered, because these are what allow
+	// go struct type resolution
+	finalOpts := append(baseOpts, libEnvOpts...)
+	extendedBase, err := cel.NewEnv(finalOpts...)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -146,12 +155,7 @@ func createBaseGpolEnv(namespace string) (*environment.EnvSet, *compiler.Variabl
 
 func (c *compilerImpl) Compile(policy policiesv1beta1.GeneratingPolicyLike, exceptions []*policiesv1beta1.PolicyException) (*Policy, field.ErrorList) {
 	var allErrs field.ErrorList
-	gpolEnvSet, variablesProvider, err := createBaseGpolEnv(policy.GetNamespace())
-	if err != nil {
-		return nil, append(allErrs, field.InternalError(nil, fmt.Errorf(compileError, err)))
-	}
-
-	env, err := gpolEnvSet.Env(environment.StoredExpressions)
+	env, variablesProvider, err := c.createBaseGpolEnv(libs.GetLibsCtx(), policy.GetNamespace())
 	if err != nil {
 		return nil, append(allErrs, field.InternalError(nil, fmt.Errorf(compileError, err)))
 	}
@@ -176,14 +180,34 @@ func (c *compilerImpl) Compile(policy policiesv1beta1.GeneratingPolicyLike, exce
 	if errs != nil {
 		return nil, append(allErrs, errs...)
 	}
-	generations := make([]cel.Program, 0, len(spec.Generation))
+	generations := make([]Generation, 0, len(spec.Generation))
 	{
 		path := path.Child("generate")
-		programs, errs := compiler.CompileGenerations(path, env, spec.Generation...)
-		if errs != nil {
-			return nil, append(allErrs, errs...)
+		for i, generation := range spec.Generation {
+			entryPath := path.Index(i)
+			switch {
+			case generation.Template != nil && generation.Expression != "":
+				return nil, append(allErrs, field.Invalid(entryPath, generation, "only one of expression or template may be set"))
+			case generation.Template != nil:
+				tpl, errs := template.Compile(entryPath.Child("template"), env, generation.Template)
+				if errs != nil {
+					return nil, append(allErrs, errs...)
+				}
+				generations = append(generations, Generation{template: tpl})
+			case generation.Expression != "":
+				program, errs := compiler.CompileGeneration(entryPath, env, generation)
+				if errs != nil {
+					return nil, append(allErrs, errs...)
+				}
+				generations = append(generations, Generation{expression: program})
+			default:
+				return nil, append(allErrs, field.Required(entryPath, "one of expression or template must be set"))
+			}
 		}
-		generations = append(generations, programs...)
+	}
+	auditAnnotations, errs := compiler.CompileAuditAnnotations(path.Child("auditAnnotations"), env, spec.AuditAnnotations...)
+	if errs != nil {
+		return nil, append(allErrs, errs...)
 	}
 	// exceptions' match conditions
 	compiledExceptions := make([]compiler.Exception, 0, len(exceptions))
@@ -198,9 +222,12 @@ func (c *compilerImpl) Compile(policy policiesv1beta1.GeneratingPolicyLike, exce
 		})
 	}
 	return &Policy{
-		matchConditions: matchConditions,
-		variables:       variables,
-		generations:     generations,
-		exceptions:      compiledExceptions,
+		namespace:        policy.GetNamespace(),
+		matchConditions:  matchConditions,
+		variables:        variables,
+		generations:      generations,
+		auditAnnotations: auditAnnotations,
+		exceptions:       compiledExceptions,
+		matchConstraints: policy.GetSpec().MatchConstraints,
 	}, nil
 }

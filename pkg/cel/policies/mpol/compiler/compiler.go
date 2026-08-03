@@ -1,39 +1,46 @@
 package compiler
 
 import (
-	"context"
 	"fmt"
+	"reflect"
 
 	cel "github.com/google/cel-go/cel"
+	celcommon "github.com/google/cel-go/common"
+	celast "github.com/google/cel-go/common/ast"
+	"github.com/google/cel-go/common/types"
+	"github.com/google/cel-go/ext"
+	"github.com/google/cel-go/parser"
 	policiesv1beta1 "github.com/kyverno/api/api/policies.kyverno.io/v1beta1"
 	compiler "github.com/kyverno/kyverno/pkg/cel/compiler"
-	"github.com/kyverno/kyverno/pkg/cel/libs/globalcontext"
-	"github.com/kyverno/kyverno/pkg/cel/libs/http"
-	"github.com/kyverno/kyverno/pkg/cel/libs/image"
-	"github.com/kyverno/kyverno/pkg/cel/libs/imagedata"
-	"github.com/kyverno/kyverno/pkg/cel/libs/json"
-	"github.com/kyverno/kyverno/pkg/cel/libs/math"
-	"github.com/kyverno/kyverno/pkg/cel/libs/random"
-	"github.com/kyverno/kyverno/pkg/cel/libs/resource"
-	"github.com/kyverno/kyverno/pkg/cel/libs/time"
-	"github.com/kyverno/kyverno/pkg/cel/libs/transform"
-	"github.com/kyverno/kyverno/pkg/cel/libs/user"
-	"github.com/kyverno/kyverno/pkg/cel/libs/x509"
-	"github.com/kyverno/kyverno/pkg/cel/libs/yaml"
-	"github.com/kyverno/kyverno/pkg/toggle"
+	"github.com/kyverno/kyverno/pkg/cel/libs"
+	"github.com/kyverno/sdk/extensions/cel/libs/globalcontext"
+	"github.com/kyverno/sdk/extensions/cel/libs/gzip"
+	"github.com/kyverno/sdk/extensions/cel/libs/hash"
+	"github.com/kyverno/sdk/extensions/cel/libs/http"
+	"github.com/kyverno/sdk/extensions/cel/libs/image"
+	"github.com/kyverno/sdk/extensions/cel/libs/imagedata"
+	"github.com/kyverno/sdk/extensions/cel/libs/json"
+	"github.com/kyverno/sdk/extensions/cel/libs/math"
+	"github.com/kyverno/sdk/extensions/cel/libs/random"
+	"github.com/kyverno/sdk/extensions/cel/libs/resource"
+	"github.com/kyverno/sdk/extensions/cel/libs/time"
+	"github.com/kyverno/sdk/extensions/cel/libs/transform"
+	"github.com/kyverno/sdk/extensions/cel/libs/user"
+	"github.com/kyverno/sdk/extensions/cel/libs/x509"
+	"github.com/kyverno/sdk/extensions/cel/libs/yaml"
 	admissionregistrationv1alpha1 "k8s.io/api/admissionregistration/v1alpha1"
 	"k8s.io/apimachinery/pkg/util/validation/field"
 	"k8s.io/apimachinery/pkg/util/version"
-	plugincel "k8s.io/apiserver/pkg/admission/plugin/cel"
-	"k8s.io/apiserver/pkg/admission/plugin/policy/mutating"
-	patch "k8s.io/apiserver/pkg/admission/plugin/policy/mutating/patch"
-	matchconditions "k8s.io/apiserver/pkg/admission/plugin/webhook/matchconditions"
+	apiservercel "k8s.io/apiserver/pkg/cel"
+	"k8s.io/apiserver/pkg/cel/common"
 	environment "k8s.io/apiserver/pkg/cel/environment"
+	"k8s.io/apiserver/pkg/cel/library"
+	"k8s.io/apiserver/pkg/cel/mutation"
 )
 
 var (
-	mpolCompilerVersion = version.MajorMinor(2, 0)
-	compileError        = "mutating policy compiler " + mpolCompilerVersion.String() + " error: %s"
+	mpolCompilerVersion  = version.MajorMinor(2, 0)
+	compileExtendedError = "mutating policy extended compiler " + mpolCompilerVersion.String() + " error: %s"
 )
 
 type Compiler interface {
@@ -48,132 +55,265 @@ type compilerImpl struct{}
 
 func (c *compilerImpl) Compile(policy policiesv1beta1.MutatingPolicyLike, exceptions []*policiesv1beta1.PolicyException) (*Policy, field.ErrorList) {
 	var allErrs field.ErrorList
+	libCtx := libs.GetLibsCtx()
 
-	baseEnvSet := environment.MustBaseEnvSet(environment.DefaultCompatibilityVersion())
-	extendedEnvSet, err := baseEnvSet.Extend(
-		environment.VersionedOptions{
-			IntroducedVersion: version.MajorMinor(1, 0),
-			EnvOptions: []cel.EnvOption{
-				cel.Variable(compiler.NamespaceObjectKey, compiler.NamespaceType.CelType()),
-				cel.Variable(compiler.ObjectKey, cel.DynType),
-				cel.Variable(compiler.OldObjectKey, cel.DynType),
-				cel.Variable(compiler.RequestKey, compiler.RequestType.CelType()),
-				cel.Variable(compiler.GlobalContextKey, globalcontext.ContextType),
-				cel.Variable(compiler.HttpKey, http.ContextType),
-				cel.Variable(compiler.ImageDataKey, imagedata.ContextType),
-				cel.Variable(compiler.ImagesKey, image.ImageType),
-				cel.Variable(compiler.ResourceKey, resource.ContextType),
-				cel.Types(compiler.NamespaceType.CelType()),
-				cel.Types(compiler.RequestType.CelType()),
-				globalcontext.Lib(image.Latest()),
-				http.Lib(image.Latest()),
-				image.Lib(image.Latest()),
-				imagedata.Lib(imagedata.Latest()),
-				math.Lib(math.Latest()),
-				resource.Lib(policy.GetNamespace(), resource.Latest()),
-				user.Lib(user.Latest()),
-				json.Lib(&json.JsonImpl{}, json.Latest()),
-				yaml.Lib(&yaml.YamlImpl{}, yaml.Latest()),
-				random.Lib(random.Latest()),
-				x509.Lib(x509.Latest()),
-				time.Lib(time.Latest()),
-				transform.Lib(transform.Latest()),
-			},
-		},
-	)
+	extendedCompiler, variablesProvider, err := c.newExtendedEnv(libCtx, policy.GetNamespace())
 	if err != nil {
-		return nil, append(allErrs, field.InternalError(nil, fmt.Errorf(compileError, err)))
+		return nil, append(allErrs, field.InternalError(nil, fmt.Errorf(compileExtendedError, err)))
 	}
 
-	compositedCompiler, err := plugincel.NewCompositedCompiler(extendedEnvSet)
-	if err != nil {
-		return nil, append(allErrs, field.InternalError(nil, fmt.Errorf(compileError, err)))
+	spec := policy.GetSpec()
+	path := field.NewPath("spec")
+	allErrs = append(allErrs, validateMAPCompatibleMatchConditions(spec)...)
+	if len(allErrs) > 0 {
+		return nil, allErrs
 	}
 
-	optionsVars := plugincel.OptionalVariableDeclarations{
-		HasParams:     false,
-		HasAuthorizer: false,
-		HasPatchTypes: true,
+	variables, errs := compiler.CompileVariables(path.Child("variables"), extendedCompiler, variablesProvider, spec.Variables...)
+	if errs != nil {
+		return nil, append(allErrs, errs...)
 	}
 
-	if policy.GetSpec().Variables != nil {
-		compositedCompiler.CompileAndStoreVariables(ConvertVariables(policy.GetSpec().Variables), optionsVars, environment.StoredExpressions)
-	}
-
-	// Compile match conditions and collect errors
-	var matcher matchconditions.Matcher = nil
-	matchConditions := policy.GetSpec().MatchConditions
-	if len(matchConditions) > 0 {
-		matchExpressionAccessors := make([]plugincel.ExpressionAccessor, len(matchConditions))
-		for i := range matchConditions {
-			matchExpressionAccessors[i] = (*matchconditions.MatchCondition)(&matchConditions[i])
-		}
-
-		evaluator := compositedCompiler.CompileCondition(matchExpressionAccessors, optionsVars, environment.StoredExpressions)
-		for _, err := range evaluator.CompilationErrors() {
-			allErrs = append(allErrs, field.Invalid(
-				field.NewPath("spec").Child("matchConditions"),
-				matchConditions[0].Expression,
-				err.Error(),
-			))
-		}
-
-		failurePolicy := policy.GetFailurePolicy(toggle.FromContext(context.TODO()).ForceFailurePolicyIgnore())
-		matcher = matchconditions.NewMatcher(
-			evaluator,
-			&failurePolicy,
-			"policy", "validate", policy.GetName())
-	}
-
-	compiledExceptions := make([]compiler.Exception, 0, len(exceptions))
-	for _, polex := range exceptions {
-		polexMatchConditions, errs := compiler.CompileMatchConditions(field.NewPath("spec").Child("matchConditions"), extendedEnvSet.StoredExpressionsEnv(), polex.Spec.MatchConditions...)
+	matchConditions := make([]cel.Program, 0, len(spec.MatchConditions))
+	{
+		path := path.Child("matchConditions")
+		programs, errs := compiler.CompileMatchConditions(path, extendedCompiler, spec.MatchConditions...)
 		if errs != nil {
 			return nil, append(allErrs, errs...)
 		}
+		matchConditions = append(matchConditions, programs...)
+	}
 
+	var targetExpression cel.Program
+	if expression := policy.GetTargetMatchConstraints().Expression; expression != "" {
+		ast, issues := extendedCompiler.Compile(expression)
+		if err := issues.Err(); err != nil {
+			return nil, append(allErrs, field.Invalid(path.Child("targetMatchConstraints").Child("expression"), expression, err.Error()))
+		}
+		if !ast.OutputType().IsExactType(types.NewMapType(types.StringType, types.AnyType)) {
+			return nil, append(allErrs, field.Invalid(path.Child("targetMatchConstraints").Child("expression"), expression, "output type must be a map"))
+		}
+		targetExpression, err = extendedCompiler.Program(ast)
+		if err != nil {
+			return nil, append(allErrs, field.InternalError(path.Child("targetMatchConstraints").Child("expression"), err))
+		}
+	}
+
+	targetMatchConditions := make([]cel.Program, 0, len(spec.TargetMatchConditions))
+	{
+		path := path.Child("targetMatchConditions")
+		programs, errs := compiler.CompileMatchConditions(path, extendedCompiler, spec.TargetMatchConditions...)
+		if errs != nil {
+			return nil, append(allErrs, errs...)
+		}
+		targetMatchConditions = append(targetMatchConditions, programs...)
+	}
+
+	// exceptions' match conditions
+	compiledExceptions := make([]compiler.Exception, 0, len(exceptions))
+	for _, polex := range exceptions {
+		polexMatchConditions, errs := compiler.CompileMatchConditions(field.NewPath("spec").Child("matchConditions"), extendedCompiler, polex.Spec.MatchConditions...)
+		if errs != nil {
+			return nil, append(allErrs, errs...)
+		}
 		compiledExceptions = append(compiledExceptions, compiler.Exception{
 			Exception:       polex,
 			MatchConditions: polexMatchConditions,
 		})
 	}
 
-	var patchers []patch.Patcher
-	patchOptions := optionsVars
-	patchOptions.HasPatchTypes = true
+	auditAnnotations, errs := compiler.CompileAuditAnnotations(path.Child("auditAnnotations"), extendedCompiler, spec.AuditAnnotations...)
+	if errs != nil {
+		return nil, append(allErrs, errs...)
+	}
+
+	useServerSideApply := false
+	if ec := spec.EvaluationConfiguration; ec != nil {
+		useServerSideApply = ec.UseServerSideApply
+	}
+
+	var patchers []Patcher
 	for i, m := range policy.GetSpec().Mutations {
 		switch m.PatchType {
 		case admissionregistrationv1alpha1.PatchTypeJSONPatch:
 			if m.JSONPatch != nil {
-				accessor := &patch.JSONPatchCondition{Expression: m.JSONPatch.Expression}
-				compileResult := compositedCompiler.CompileMutatingEvaluator(accessor, patchOptions, environment.StoredExpressions)
-				for _, err := range compileResult.CompilationErrors() {
-					allErrs = append(allErrs, field.Invalid(
-						field.NewPath("spec").Child("mutations").Index(i).Child("jsonPatch"),
-						m.JSONPatch.Expression,
-						err.Error(),
-					))
+				prog, errs := compiler.CompileMutation(path.Child("mutations").Index(i).Child("jsonPatch"), extendedCompiler, m.JSONPatch.Expression, cel.ListType(jsonPatchType))
+				if errs != nil {
+					return nil, append(allErrs, errs...)
 				}
-
-				patchers = append(patchers, patch.NewJSONPatcher(compileResult))
+				patchers = append(patchers, newJSONPatcher(prog))
 			}
 		case admissionregistrationv1alpha1.PatchTypeApplyConfiguration:
 			if m.ApplyConfiguration != nil {
-				accessor := &patch.ApplyConfigurationCondition{Expression: m.ApplyConfiguration.Expression}
-				compileResult := compositedCompiler.CompileMutatingEvaluator(accessor, patchOptions, environment.StoredExpressions)
-				for _, err := range compileResult.CompilationErrors() {
-					allErrs = append(allErrs, field.Invalid(
-						field.NewPath("spec").Child("mutations").Index(i).Child("applyConfiguration"),
-						m.ApplyConfiguration.Expression,
-						err.Error(),
-					))
+				prog, errs := compiler.CompileMutation(path.Child("mutations").Index(i).Child("applyConfiguration"), extendedCompiler, m.ApplyConfiguration.Expression, applyConfigObjectType)
+				if errs != nil {
+					return nil, append(allErrs, errs...)
 				}
-				patchers = append(patchers, patch.NewApplyConfigurationPatcher(compileResult))
+				patchers = append(patchers, newApplyConfigPatcher(prog, useServerSideApply))
 			}
 		}
 	}
+
 	return &Policy{
-		evaluator:  mutating.PolicyEvaluator{Matcher: matcher, Mutators: patchers, CompositionEnv: compositedCompiler.CompositionEnv},
-		exceptions: compiledExceptions,
+		matchConditions:       matchConditions,
+		targetMatchConditions: targetMatchConditions,
+		targetExpression:      targetExpression,
+		variables:             variables,
+		auditAnnotations:      auditAnnotations,
+		exceptions:            compiledExceptions,
+		matchConstraints:      policy.GetSpec().MatchConstraints,
+		patchers:              patchers,
 	}, allErrs
+}
+
+func (c *compilerImpl) newExtendedEnv(libCtx libs.Context, namespace string) (*cel.Env, *compiler.VariablesProvider, error) {
+	baseOpts := compiler.DefaultEnvOptionsWithCompat()
+	baseOpts = append(baseOpts,
+		cel.Variable(compiler.NamespaceObjectKey, compiler.NamespaceType.CelType()),
+		cel.Variable(compiler.ObjectKey, cel.DynType),
+		cel.Variable(compiler.OldObjectKey, cel.DynType),
+		cel.Variable(compiler.RequestKey, compiler.RequestType.CelType()),
+		cel.Types(compiler.NamespaceType.CelType()),
+		cel.Types(compiler.RequestType.CelType()),
+		cel.Types(applyConfigObjectType),
+		cel.Types(jsonPatchType),
+		cel.Variable(compiler.VariablesKey, compiler.VariablesType),
+	)
+
+	base := environment.MustBaseEnvSet(mpolCompilerVersion)
+	env, err := base.Env(environment.StoredExpressions)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	variablesProvider := compiler.NewVariablesProvider(env.CELTypeProvider())
+	declProvider := apiservercel.NewDeclTypeProvider(compiler.NamespaceType, compiler.RequestType)
+	declOptions, err := declProvider.EnvOptions(variablesProvider)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	baseOpts = append(baseOpts, declOptions...)
+	baseOpts = append(baseOpts, common.ResolverEnvOption(&mutation.DynamicTypeResolver{}))
+
+	libEnvOpts := []cel.EnvOption{
+		ext.NativeTypes(reflect.TypeFor[libs.Exception](), ext.ParseStructTags(true)),
+		cel.Variable(compiler.ExceptionsKey, types.NewObjectType("libs.Exception")),
+		environment.UnversionedLib(library.JSONPatch), // the kubernetes jsonpatch library to enable escapeKey
+		globalcontext.Lib(
+			globalcontext.Context{ContextInterface: libCtx},
+			globalcontext.Latest(),
+		),
+		resource.Lib(
+			resource.Context{ContextInterface: libCtx},
+			namespace,
+			resource.Latest(),
+		),
+		image.Lib(
+			image.Latest(),
+		),
+		imagedata.Lib(
+			imagedata.Context{ContextInterface: libCtx},
+			imagedata.Latest(),
+			nil, // this policy doesn't have a way to specify extra registry credentials, only the ivpol does.
+		),
+		hash.Lib(
+			hash.Latest(),
+		),
+		math.Lib(
+			math.Latest(),
+		),
+		json.Lib(
+			&json.JsonImpl{},
+			json.Latest(),
+		),
+		yaml.Lib(
+			&yaml.YamlImpl{},
+			yaml.Latest(),
+		),
+		random.Lib(
+			random.Latest(),
+		),
+		x509.Lib(
+			x509.Latest(),
+		),
+		time.Lib(
+			time.Latest(),
+		),
+		transform.Lib(
+			transform.Latest(),
+		),
+		gzip.Lib(
+			gzip.Latest(),
+		),
+		user.Lib(
+			user.Latest(),
+		),
+		http.Lib(
+			http.Context{ContextInterface: libs.NewMockAwareHTTPContext(compiler.NewLazyCELHTTPContext(namespace), libCtx.GetHTTPMocks())},
+			http.Latest(),
+		),
+	}
+
+	// the custom types have to be registered after the decl options have been registered, because these are what allow
+	// go struct type resolution
+	extendedBase, err := base.Extend(
+		environment.VersionedOptions{
+			IntroducedVersion: mpolCompilerVersion,
+			EnvOptions:        baseOpts,
+		},
+		// libraries
+		environment.VersionedOptions{
+			IntroducedVersion: mpolCompilerVersion,
+			EnvOptions:        libEnvOpts,
+		},
+	)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	extendedEnv, err := extendedBase.Env(environment.StoredExpressions)
+	if err != nil {
+		return nil, nil, err
+	}
+	return extendedEnv, variablesProvider, nil
+}
+
+func validateMAPCompatibleMatchConditions(spec *policiesv1beta1.MutatingPolicySpec) field.ErrorList {
+	var errs field.ErrorList
+	if spec == nil || !spec.GenerateMutatingAdmissionPolicyEnabled() || len(spec.MatchConditions) == 0 {
+		return nil
+	}
+
+	for i := range spec.MatchConditions {
+		condition := spec.MatchConditions[i]
+		parsed, parseErrs := parser.Parse(celcommon.NewStringSource(condition.Expression, "matchCondition"))
+		if parseErrs != nil && len(parseErrs.GetErrors()) > 0 {
+			continue
+		}
+		if referencesVariables(parsed.Expr()) {
+			errs = append(errs, field.Forbidden(
+				field.NewPath("spec").Child("matchConditions").Index(i).Child("expression"),
+				"variables cannot be referenced in matchConditions when spec.autogen.mutatingAdmissionPolicy.enabled is true; native MutatingAdmissionPolicy evaluates match conditions before variables, so inline the expression instead",
+			))
+		}
+	}
+	return errs
+}
+
+func referencesVariables(expr celast.Expr) bool {
+	if expr == nil {
+		return false
+	}
+
+	found := false
+	celast.PreOrderVisit(expr, celast.NewExprVisitor(func(node celast.Expr) {
+		if found || node == nil {
+			return
+		}
+		if node.Kind() == celast.IdentKind && node.AsIdent() == "variables" {
+			found = true
+		}
+	}))
+	return found
 }

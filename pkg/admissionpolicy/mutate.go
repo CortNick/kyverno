@@ -6,10 +6,10 @@ import (
 	"time"
 
 	celmatching "github.com/kyverno/kyverno/pkg/cel/matching"
-	celutils "github.com/kyverno/kyverno/pkg/cel/utils"
 	"github.com/kyverno/kyverno/pkg/clients/dclient"
 	"github.com/kyverno/kyverno/pkg/engine/adapters"
 	engineapi "github.com/kyverno/kyverno/pkg/engine/api"
+	celutils "github.com/kyverno/sdk/extensions/cel/utils"
 	admissionregistrationv1 "k8s.io/api/admissionregistration/v1"
 	admissionregistrationv1beta1 "k8s.io/api/admissionregistration/v1beta1"
 	authenticationv1 "k8s.io/api/authentication/v1"
@@ -62,10 +62,7 @@ func Mutate(
 			},
 		}
 	}
-	var user UserInfo
-	if userInfo != nil {
-		user = NewUser(*userInfo)
-	}
+	user := ResolveUser(userInfo)
 	a := admission.NewAttributesRecord(resource.DeepCopyObject(), nil, gvk, resource.GetNamespace(), resource.GetName(), gvr, "", admission.Create, nil, false, user)
 
 	if len(bindings) == 0 {
@@ -93,7 +90,7 @@ func processMAPNoBindings(policy *admissionregistrationv1beta1.MutatingAdmission
 		return engineapi.NewEngineResponse(resource, engineapi.NewMutatingAdmissionPolicy(policy), nil), nil
 	}
 
-	mapLogger.V(3).Info("apply mutatingadmissionpolicy %s to resource %s", policy.GetName(), resPath)
+	mapLogger.V(3).Info("applying mutatingadmissionpolicy to resource", "policy", policy.GetName(), "resource", resPath)
 	er, err = mutateResource(policy, nil, resource, nil, gvr, namespace, a, backgroundScan)
 	if err != nil {
 		mapLogger.Error(err, "failed to mutate resource with mutatingadmissionpolicy", "policy", policy.GetName(), "resource", resPath)
@@ -120,7 +117,7 @@ func processMAPWithClient(policy *admissionregistrationv1beta1.MutatingAdmission
 		}
 	}
 
-	isMatch, _, _, err := matcher.DefinitionMatches(a, o, mutating.NewMutatingAdmissionPolicyAccessor(policy))
+	isMatch, _, _, err := matcher.DefinitionMatches(a, o, mutating.NewMutatingAdmissionPolicyAccessor(ConvertMutatingAdmissionPolicy(policy)))
 	if err != nil {
 		mapLogger.Error(err, "failed to match policy definition for mutatingadmissionpolicy", "policy", policy.GetName(), "resource", resPath)
 		return er, err
@@ -147,7 +144,7 @@ func processMAPWithClient(policy *admissionregistrationv1beta1.MutatingAdmission
 			}
 		}
 
-		isMatch, err := matcher.BindingMatches(a, o, mutating.NewMutatingAdmissionPolicyBindingAccessor(&binding))
+		isMatch, err := matcher.BindingMatches(a, o, mutating.NewMutatingAdmissionPolicyBindingAccessor(ConvertMutatingAdmissionPolicyBinding(&binding)))
 		if err != nil {
 			mapLogger.Error(err, "failed to match policy binding for mutatingadmissionpolicy", "policy", policy.GetName(), "binding", binding.GetName(), "resource", resPath)
 			continue

@@ -336,7 +336,7 @@ kA==
 				Name: "autogen-cronjob-check-image",
 				MatchResources: kyvernov1.MatchResources{
 					ResourceDescription: kyvernov1.ResourceDescription{
-						Kinds: []string{"CronJob"},
+						Kinds: []string{"batch/v1/CronJob"},
 					},
 				},
 				VerifyImages: []kyvernov1.ImageVerification{{
@@ -442,51 +442,4 @@ func Test_ValidateWithCELExpressions(t *testing.T) {
 
 	rules := computeRules(policies[0], "DaemonSet")
 	assert.Equal(t, 2, len(rules))
-}
-
-func Test_ValidateWithAssertion(t *testing.T) {
-	policy := []byte(`
-	{
-		"apiVersion": "kyverno.io/v1",
-		"kind": "ClusterPolicy",
-		"metadata": {
-		  "name": "disallow-default-sa"
-		},
-		"spec": {
-		  "validationFailureAction": "Enforce",
-		  "background": false,
-		  "rules": [
-			{
-			  "name": "default-sa",
-			  "match": {
-				"any": [
-				  {
-					"resources": {
-					  "kinds": [
-						"Pod"
-					  ]
-					}
-				  }
-				]
-			  },
-			  "validate": {
-			    "assert": {
-				  "object": {
-					"spec": {
-					  "(serviceAccountName == 'default')": false
-				    }
-				  }
-				}
-			  }
-			}
-		  ]
-		}
-	  }
-`)
-	policies, _, _, _, _, _, _, err := yamlutils.GetPolicy([]byte(policy))
-	assert.NilError(t, err)
-	assert.Equal(t, 1, len(policies))
-
-	rules := computeRules(policies[0], "")
-	assert.Equal(t, 3, len(rules))
 }

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"flag"
+	"fmt"
 	"os"
 	"strings"
 	"time"
@@ -13,6 +14,8 @@ import (
 	"github.com/kyverno/kyverno/pkg/background"
 	"github.com/kyverno/kyverno/pkg/background/gpol"
 	"github.com/kyverno/kyverno/pkg/breaker"
+	celcompiler "github.com/kyverno/kyverno/pkg/cel/compiler"
+	celengine "github.com/kyverno/kyverno/pkg/cel/engine"
 	"github.com/kyverno/kyverno/pkg/cel/libs"
 	"github.com/kyverno/kyverno/pkg/cel/matching"
 	gpolcompiler "github.com/kyverno/kyverno/pkg/cel/policies/gpol/compiler"
@@ -25,6 +28,7 @@ import (
 	"github.com/kyverno/kyverno/pkg/config"
 	globalcontextcontroller "github.com/kyverno/kyverno/pkg/controllers/globalcontext"
 	policymetricscontroller "github.com/kyverno/kyverno/pkg/controllers/metrics/policy"
+	updaterequestmetricscontroller "github.com/kyverno/kyverno/pkg/controllers/metrics/updaterequest"
 	engineapi "github.com/kyverno/kyverno/pkg/engine/api"
 	"github.com/kyverno/kyverno/pkg/engine/apicall"
 	"github.com/kyverno/kyverno/pkg/engine/jmespath"
@@ -34,11 +38,11 @@ import (
 	"github.com/kyverno/kyverno/pkg/logging"
 	"github.com/kyverno/kyverno/pkg/metrics"
 	"github.com/kyverno/kyverno/pkg/policy"
+	"github.com/kyverno/kyverno/pkg/toggle"
 	"github.com/kyverno/kyverno/pkg/utils/generator"
 	kubeutils "github.com/kyverno/kyverno/pkg/utils/kube"
 	reportutils "github.com/kyverno/kyverno/pkg/utils/report"
 	"github.com/kyverno/kyverno/pkg/utils/restmapper"
-	corev1 "k8s.io/api/core/v1"
 	apiserver "k8s.io/apiextensions-apiserver/pkg/client/clientset/clientset"
 	"k8s.io/apimachinery/pkg/api/meta"
 	kruntime "k8s.io/apimachinery/pkg/runtime"
@@ -81,6 +85,9 @@ func createrLeaderControllers(
 		kyvernoInformer.Kyverno().V1().ClusterPolicies(),
 		kyvernoInformer.Kyverno().V1().Policies(),
 		kyvernoInformer.Policies().V1beta1().GeneratingPolicies(),
+		kyvernoInformer.Policies().V1beta1().NamespacedGeneratingPolicies(),
+		kyvernoInformer.Policies().V1beta1().MutatingPolicies(),
+		kyvernoInformer.Policies().V1beta1().NamespacedMutatingPolicies(),
 		kyvernoInformer.Kyverno().V2().UpdateRequests(),
 		configuration,
 		eventGenerator,
@@ -91,6 +98,8 @@ func createrLeaderControllers(
 		jp,
 		urGenerator,
 		watchManager,
+		gpolEngine,
+		gpolProvider,
 	)
 	if err != nil {
 		return nil, err
@@ -126,7 +135,9 @@ func main() {
 		maxQueuedEvents                 int
 		omitEvents                      string
 		maxAPICallResponseLength        int64
+		apiCallTimeout                  time.Duration
 		maxBackgroundReports            int
+		maxGlobalContextEntries         int
 		controllerRuntimeMetricsAddress string
 	)
 	flagset := flag.NewFlagSet("updaterequest-controller", flag.ExitOnError)
@@ -134,8 +145,13 @@ func main() {
 	flagset.IntVar(&maxQueuedEvents, "maxQueuedEvents", 1000, "Maximum events to be queued.")
 	flagset.StringVar(&omitEvents, "omitEvents", "", "Set this flag to a comma sperated list of PolicyViolation, PolicyApplied, PolicyError, PolicySkipped to disable events, e.g. --omitEvents=PolicyApplied,PolicyViolation")
 	flagset.Int64Var(&maxAPICallResponseLength, "maxAPICallResponseLength", 2*1000*1000, "Maximum allowed response size from API Calls. A value of 0 bypasses checks (not recommended).")
+	flagset.DurationVar(&apiCallTimeout, "apiCallTimeout", 30*time.Second, "Timeout for HTTP API calls made by policies. A value of 0 means no timeout.")
 	flagset.IntVar(&maxBackgroundReports, "maxBackgroundReports", 10000, "Maximum number of ephemeralreports created for the background policies.")
+	flagset.IntVar(&maxGlobalContextEntries, "maxGlobalContextEntries", 0, "Maximum number of entries in the global context store. When the limit is reached, new entries are rejected and retried. A value of 0 means unbounded.")
 	flagset.StringVar(&controllerRuntimeMetricsAddress, "controllerRuntimeMetricsAddress", "", `Bind address for controller-runtime metrics server. It will be defaulted to ":8080" if unspecified. Set this to "0" to disable the metrics server.`)
+	flagset.Func(toggle.AllowHTTPInNamespacedPoliciesFlagName, toggle.AllowHTTPInNamespacedPoliciesDescription, toggle.AllowHTTPInNamespacedPolicies.Parse)
+	flagset.Func(toggle.HTTPBlocklistFlagName, toggle.HTTPBlocklistDescription, toggle.HTTPBlocklist.Parse)
+	flagset.Func(toggle.HTTPAllowlistFlagName, toggle.HTTPAllowlistDescription, toggle.HTTPAllowlist.Parse)
 
 	// config
 	appConfig := internal.NewConfiguration(
@@ -160,6 +176,12 @@ func main() {
 	)
 	// parse flags
 	internal.ParseFlags(appConfig)
+	apicall.SetScopedTokenClientTimeout(apiCallTimeout)
+	// Validate HTTP blocklist/allowlist flags at startup (fail-fast).
+	if err := celcompiler.ValidateHTTPFlags(); err != nil {
+		fmt.Fprintf(os.Stderr, "invalid HTTP flag configuration: %v\n", err)
+		os.Exit(1)
+	}
 	var wg wait.Group
 	func() {
 		// setup
@@ -198,7 +220,7 @@ func main() {
 			event.Workers,
 		)
 		urGenerator := generator.NewUpdateRequestGenerator(setup.Configuration, setup.MetadataClient)
-		gcstore := store.New()
+		gcstore := store.New(maxGlobalContextEntries)
 		gceController := internal.NewController(
 			globalcontextcontroller.ControllerName,
 			globalcontextcontroller.NewController(
@@ -209,6 +231,7 @@ func main() {
 				gcstore,
 				eventGenerator,
 				maxAPICallResponseLength,
+				apiCallTimeout,
 				false,
 				setup.Jp,
 			),
@@ -219,18 +242,20 @@ func main() {
 			kyvernoInformer.Kyverno().V1().Policies(),
 			&wg,
 		)
+		updaterequestmetricscontroller.NewController(
+			kyvernoInformer.Kyverno().V2().UpdateRequests(),
+		)
 		engine := internal.NewEngine(
 			signalCtx,
 			setup.Logger,
 			setup.Configuration,
 			setup.Jp,
 			setup.KyvernoDynamicClient,
-			setup.RegistryClient,
 			setup.ImageVerifyCacheClient,
 			setup.KubeClient,
 			setup.KyvernoClient,
 			setup.RegistrySecretLister,
-			apicall.NewAPICallConfiguration(maxAPICallResponseLength),
+			apicall.NewAPICallConfiguration(maxAPICallResponseLength, apiCallTimeout),
 			polexCache,
 			gcstore,
 		)
@@ -253,17 +278,17 @@ func main() {
 						time.Sleep(2 * time.Second)
 						continue
 					}
-					breaker.ReportsBreaker = breaker.NewBreaker("background-scan reports", ephrCounterFunc(ephrs))
+					breaker.SetReportsBreaker(breaker.NewBreaker("background-scan reports", ephrCounterFunc(ephrs)))
 					return
 				}
 			}()
 			// temporarily create a fake breaker until the retrying goroutine succeeds
-			breaker.ReportsBreaker = breaker.NewBreaker("background-scan reports", func(context.Context) bool {
+			breaker.SetReportsBreaker(breaker.NewBreaker("background-scan reports", func(context.Context) bool {
 				return true
-			})
+			}))
 			// no error occurred, create a normal breaker
 		} else {
-			breaker.ReportsBreaker = breaker.NewBreaker("background-scan reports", ephrCounterFunc(ephrs))
+			breaker.SetReportsBreaker(breaker.NewBreaker("background-scan reports", ephrCounterFunc(ephrs)))
 		}
 		// start informers and wait for cache sync
 		if !internal.StartInformersAndWaitForCacheSync(signalCtx, setup.Logger, kyvernoInformer) {
@@ -285,7 +310,7 @@ func main() {
 				kyvernoInformer := kyvernoinformer.NewSharedInformerFactory(setup.KyvernoClient, setup.ResyncPeriod)
 				nsLister := kubeInformer.Core().V1().Namespaces().Lister()
 
-				restMapper, err := restmapper.GetRESTMapper(setup.KyvernoDynamicClient, false)
+				restMapper, err := restmapper.GetRESTMapper(setup.KyvernoDynamicClient)
 				if err != nil {
 					setup.Logger.Error(err, "failed to create RESTMapper")
 					os.Exit(1)
@@ -293,7 +318,7 @@ func main() {
 
 				contextProvider, err := libs.NewContextProvider(
 					setup.KyvernoDynamicClient,
-					nil,
+					setup.RegistrySecretLister,
 					gcstore,
 					restMapper,
 					false,
@@ -303,13 +328,7 @@ func main() {
 					os.Exit(1)
 				}
 
-				namespaceGetter := func(name string) *corev1.Namespace {
-					ns, err := nsLister.Get(name)
-					if err != nil {
-						return nil
-					}
-					return ns
-				}
+				namespaceGetter := celengine.NewNamespaceResolver(logger.WithName("ns-resolver"), nsLister, setup.KubeClient)
 
 				// create compiler
 				compiler := gpolcompiler.NewCompiler()
@@ -318,7 +337,7 @@ func main() {
 					compiler,
 					kyvernoInformer.Policies().V1beta1().GeneratingPolicies().Lister(),
 					kyvernoInformer.Policies().V1beta1().NamespacedGeneratingPolicies().Lister(),
-					kyvernoInformer.Policies().V1beta1().PolicyExceptions().Lister(),
+					celengine.NewPolicyExceptionLister(kyvernoInformer.Policies().V1beta1().PolicyExceptions().Lister(), internal.ExceptionNamespace()),
 					internal.PolicyExceptionEnabled(),
 				)
 				// create engine
@@ -356,7 +375,7 @@ func main() {
 				}
 
 				c := mpolcompiler.NewCompiler()
-				mpolProvider, typeConverter, err := mpolengine.NewKubeProvider(mgrCtx, c, mgr, setup.KubeClient.Discovery().OpenAPIV3(), kyvernoInformer.Policies().V1beta1().PolicyExceptions().Lister(), internal.PolicyExceptionEnabled())
+				mpolProvider, typeConverter, err := mpolengine.NewKubeProvider(mgrCtx, c, contextProvider, mgr, setup.KubeClient.Discovery().OpenAPIV3(), celengine.NewPolicyExceptionLister(kyvernoInformer.Policies().V1beta1().PolicyExceptions().Lister(), internal.ExceptionNamespace()), internal.PolicyExceptionEnabled())
 				if err != nil {
 					setup.Logger.Error(err, "failed to create mpol provider")
 					os.Exit(1)

@@ -19,8 +19,8 @@ import (
 	"github.com/kyverno/kyverno/pkg/engine/context/resolvers"
 	"github.com/kyverno/kyverno/pkg/engine/factories"
 	"github.com/kyverno/kyverno/pkg/engine/jmespath"
-	"github.com/kyverno/kyverno/pkg/imageverifycache"
-	"github.com/kyverno/kyverno/pkg/registryclient"
+	imageverifycache "github.com/kyverno/kyverno/pkg/image/verification/cache"
+	"github.com/kyverno/sdk/extensions/registryclient"
 	"k8s.io/client-go/kubernetes"
 	corev1listers "k8s.io/client-go/listers/core/v1"
 )
@@ -31,11 +31,10 @@ func NewEngine(
 	configuration config.Configuration,
 	jp jmespath.Interface,
 	client dclient.Interface,
-	rclient registryclient.Client,
 	ivCache imageverifycache.Client,
 	kubeClient kubernetes.Interface,
 	kyvernoClient versioned.Interface,
-	secretLister corev1listers.SecretNamespaceLister,
+	secretLister corev1listers.SecretLister,
 	apiCallConfig apicall.APICallConfiguration,
 	exceptionsSelector engineapi.PolicyExceptionSelector,
 	gctxStore loaders.Store,
@@ -47,7 +46,7 @@ func NewEngine(
 		configuration,
 		jp,
 		adapters.Client(client),
-		factories.DefaultRegistryClientFactory(adapters.RegistryClient(rclient), secretLister),
+		factories.DefaultRegistryClientFactory(adapters.RegistryClient(registryclient.MustRegistryClient()), secretLister),
 		ivCache,
 		factories.DefaultContextLoaderFactory(configMapResolver, factories.WithAPICallConfig(apiCallConfig), factories.WithGlobalContextStore(gctxStore)),
 		exceptionsSelector,

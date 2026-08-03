@@ -8,6 +8,7 @@ import (
 	"time"
 
 	policiesv1beta1 "github.com/kyverno/api/api/policies.kyverno.io/v1beta1"
+	"github.com/kyverno/kyverno/pkg/admissionpolicy"
 	"github.com/kyverno/kyverno/pkg/cel/engine"
 	"github.com/kyverno/kyverno/pkg/cel/libs"
 	"github.com/kyverno/kyverno/pkg/cel/matching"
@@ -86,8 +87,7 @@ func (e *engineImpl) Handle(ctx context.Context, request EngineRequest, predicat
 		admission.Operation(request.Request.Operation),
 		nil,
 		dryRun,
-		// TODO
-		nil,
+		admissionpolicy.NewUser(request.Request.UserInfo),
 	)
 	// resolve namespace
 	var namespace runtime.Object
@@ -116,9 +116,8 @@ func (e *engineImpl) handlePolicy(ctx context.Context, policy Policy, jsonPayloa
 		Actions: policy.Actions,
 		Policy:  policy.Policy,
 	}
-	spec := policy.Policy.GetValidatingPolicySpec()
 	if e.matcher != nil {
-		matches, err := e.matchPolicy(spec.MatchConstraints, attr, namespace)
+		matches, err := e.matchPolicy(policy.CompiledPolicy.MatchConstraints(), attr, namespace)
 		if err != nil {
 			response.Rules = handlers.WithResponses(engineapi.RuleError("match", engineapi.Validation, "failed to execute matching", err, nil))
 			return response
@@ -137,7 +136,7 @@ func (e *engineImpl) handlePolicy(ctx context.Context, policy Policy, jsonPayloa
 	if err != nil {
 		response.Rules = handlers.WithResponses(engineapi.RuleError("evaluation", engineapi.Validation, "failed to load context", err, nil))
 	} else if result == nil {
-		response.Rules = append(response.Rules, *engineapi.RuleSkip("", engineapi.Validation, "skip", nil))
+		response.Rules = append(response.Rules, *engineapi.RuleSkip("", engineapi.Validation, "skip", nil).WithSkipReason(engineapi.SkipReasonMatchConditions))
 	} else if len(result.Exceptions) > 0 {
 		exceptions := make([]engineapi.GenericException, 0, len(result.Exceptions))
 		keys := make([]string, 0, len(result.Exceptions))
@@ -196,14 +195,30 @@ func (e *engineImpl) handlePolicy(ctx context.Context, policy Policy, jsonPayloa
 		// TODO: do we want to set a rule name?
 		ruleName := ""
 		if result.Error != nil {
-			response.Rules = append(response.Rules, *engineapi.RuleError(ruleName, engineapi.Validation, "error", err, nil))
+			response.Rules = append(response.Rules, *engineapi.RuleError(ruleName, engineapi.Validation, "error", result.Error, withValidationIndex(nil, result.Index)))
 		} else if result.Result {
-			response.Rules = append(response.Rules, *engineapi.RulePass(ruleName, engineapi.Validation, "success", nil))
+			response.Rules = append(response.Rules, *engineapi.RulePass(ruleName, engineapi.Validation, "success", result.AuditAnnotations))
 		} else {
-			response.Rules = append(response.Rules, *engineapi.RuleFail(ruleName, engineapi.Validation, result.Message, result.AuditAnnotations))
+			response.Rules = append(response.Rules, *engineapi.RuleFail(ruleName, engineapi.Validation, result.Message, withValidationIndex(result.AuditAnnotations, result.Index)))
 		}
 	}
 	return response
+}
+
+const validationIndexKey = "cel.validationIndex"
+
+// withValidationIndex returns a copy of props with validationIndexKey set to
+// the zero-based position of the failing validation expression when that key
+// is not already present.
+func withValidationIndex(props map[string]string, idx int) map[string]string {
+	out := make(map[string]string, len(props)+1)
+	for k, v := range props {
+		out[k] = v
+	}
+	if _, exists := out[validationIndexKey]; !exists {
+		out[validationIndexKey] = strconv.Itoa(idx)
+	}
+	return out
 }
 
 func (e *engineImpl) matchPolicy(constraints *admissionregistrationv1.MatchResources, attr admission.Attributes, namespace runtime.Object) (bool, error) {

@@ -2,6 +2,7 @@ package globalcontext
 
 import (
 	"context"
+	"errors"
 	"time"
 
 	"github.com/go-logr/logr"
@@ -28,9 +29,10 @@ import (
 
 const (
 	// Workers is the number of workers for this controller
-	Workers        = 1
-	ControllerName = "global-context"
-	maxRetries     = 10
+	Workers               = 1
+	ControllerName        = "global-context"
+	maxRetries            = 10
+	storeFullRequeueDelay = 1 * time.Minute
 )
 
 type controller struct {
@@ -47,6 +49,7 @@ type controller struct {
 	store              store.Store
 	eventGen           event.Interface
 	maxResponseLength  int64
+	apiCallTimeout     time.Duration
 	shouldUpdateStatus bool
 	jp                 jmespath.Interface
 }
@@ -59,6 +62,7 @@ func NewController(
 	storage store.Store,
 	eventGen event.Interface,
 	maxResponseLength int64,
+	apiCallTimeout time.Duration,
 	shouldUpdateStatus bool,
 	jp jmespath.Interface,
 ) controllers.Controller {
@@ -75,6 +79,7 @@ func NewController(
 		store:              storage,
 		eventGen:           eventGen,
 		maxResponseLength:  maxResponseLength,
+		apiCallTimeout:     apiCallTimeout,
 		shouldUpdateStatus: shouldUpdateStatus,
 		jp:                 jp,
 	}
@@ -127,14 +132,33 @@ func (c *controller) reconcile(ctx context.Context, logger logr.Logger, key, _, 
 		}
 		return err
 	}
+	if err := c.store.CheckCapacity(name); err != nil {
+		if errors.Is(err, store.ErrStoreFull) {
+			c.requeueStoreFull(logger, key)
+			return nil
+		}
+		return err
+	}
 	// either it's a new entry or an existing entry changed
 	// create a new element and set it in the store
 	entry, err := c.makeStoreEntry(ctx, gce)
 	if err != nil {
 		return err
 	}
-	c.store.Set(name, entry)
+	if err := c.store.Set(name, entry); err != nil {
+		entry.Stop()
+		if errors.Is(err, store.ErrStoreFull) {
+			c.requeueStoreFull(logger, key)
+			return nil
+		}
+		return err
+	}
 	return nil
+}
+
+func (c *controller) requeueStoreFull(logger logr.Logger, key any) {
+	logger.V(3).Info("global context store is full, requeueing after delay", "key", key)
+	c.queue.AddAfter(key, storeFullRequeueDelay)
 }
 
 func (c *controller) getEntry(name string) (*kyvernov2beta1.GlobalContextEntry, error) {
@@ -170,6 +194,7 @@ func (c *controller) makeStoreEntry(ctx context.Context, gce *kyvernov2beta1.Glo
 		gce.Spec.APICall.APICall,
 		gce.Spec.APICall.RefreshInterval.Duration,
 		c.maxResponseLength,
+		c.apiCallTimeout,
 		c.shouldUpdateStatus,
 		c.jp,
 	)

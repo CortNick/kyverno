@@ -1,6 +1,8 @@
 package v1
 
 import (
+	"reflect"
+
 	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/apimachinery/pkg/util/validation/field"
 )
@@ -31,6 +33,16 @@ type MatchResources struct {
 	ResourceDescription `json:"resources,omitempty"`
 }
 
+func (m *MatchResources) IsEmpty() bool {
+	if m == nil {
+		return true
+	}
+	if len(m.Any) > 0 || len(m.All) > 0 {
+		return false
+	}
+	return m.ResourceDescription.IsEmpty() && reflect.DeepEqual(m.UserInfo, UserInfo{})
+}
+
 // GetKinds returns all kinds
 func (m *MatchResources) GetKinds() []string {
 	var kinds []string
@@ -59,7 +71,7 @@ func (m *MatchResources) Validate(path *field.Path, namespaced bool, clusterReso
 	}
 	allPath := path.Child("all")
 	for i, filter := range m.All {
-		errs = append(errs, filter.UserInfo.Validate(anyPath.Index(i))...)
+		errs = append(errs, filter.UserInfo.Validate(allPath.Index(i))...)
 		errs = append(errs, filter.ResourceDescription.Validate(allPath.Index(i), namespaced, clusterResources)...)
 	}
 	errs = append(errs, m.UserInfo.Validate(path)...)
